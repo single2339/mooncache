@@ -228,6 +228,39 @@ impl VendorAdapter for CountingVendor {
     }
 }
 
+struct ModelIneligibleVendor {
+    inner: MockVendorAdapter,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl VendorAdapter for ModelIneligibleVendor {
+    fn vendor_id(&self) -> &str {
+        self.inner.vendor_id()
+    }
+
+    fn adapter_version(&self) -> &str {
+        self.inner.adapter_version()
+    }
+
+    fn model_cache_eligible(&self, _requested_model: &str) -> bool {
+        false
+    }
+
+    async fn resolve_model_version(&self, requested_model: &str) -> Result<String, VendorError> {
+        self.inner.resolve_model_version(requested_model).await
+    }
+
+    async fn complete(&self, request: ResponsesRequest) -> Result<VendorResponse, VendorError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.complete(request).await
+    }
+
+    async fn stream(&self, request: ResponsesRequest) -> Result<VendorEventStream, VendorError> {
+        self.inner.stream(request).await
+    }
+}
+
 struct BlockingOnceVendor {
     inner: MockVendorAdapter,
     calls: Arc<AtomicUsize>,
@@ -346,6 +379,101 @@ async fn configured_api_key_authenticates_configured_tenant() {
     assert_eq!(response.status_code, 200);
     assert_eq!(response.headers["x-cache-status"], "miss");
     assert_eq!(response.body["output_text"], "configured");
+}
+
+#[tokio::test]
+async fn configured_tenant_rejects_unallowed_vendor() {
+    let tenants = TenantConfigSet::parse_toml(
+        r#"
+        [[tenants]]
+        id = "configured-tenant"
+        name = "Configured Tenant"
+        enabled = true
+        api_key_sha256 = "e46ea83ec368dc44797a4b7da96ad92963dae141d417cd89fdb211b488422b0f"
+        dram_quota_bytes = 1048576
+        ssd_quota_bytes = 0
+        request_rate_limit_per_minute = 1
+        stream_concurrency_limit = 1
+        vendor_spend_budget_usd = 1
+        default_ttl_seconds = 60
+        max_ttl_seconds = 60
+        policy = "cache_first"
+        allowed_vendors = ["other"]
+        "#,
+    )
+    .unwrap();
+    let mut master = MasterState::new_for_test();
+    master.mount_segment("node-a", 1024 * 1024);
+    master
+        .set_tenant_quota("configured-tenant", 1024 * 1024, 0)
+        .expect("configured tenant quota should be valid");
+    let store = MemoryStore::with_capacity(1024 * 1024);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let vendor = Arc::new(CountingVendor::new(
+        MockVendorAdapter::new_json(json!({"id":"resp_configured","output_text":"configured"})),
+        Arc::clone(&calls),
+    ));
+    let state = Arc::new(GatewayState::new_with_tenant_config(
+        master, store, vendor, tenants,
+    ));
+
+    let response = handle_response_request(
+        &state,
+        GatewayRequest {
+            authorization: Some("Bearer demo-api-key-do-not-use".to_owned()),
+            cache_control: None,
+            body: json!({"model":"gpt-test","input":"hello","temperature":0}),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status_code, 403);
+    assert_eq!(response.headers["x-cache-status"], "bypass");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn model_cache_ineligible_bypasses_cache_writes() {
+    let mut master = MasterState::new_for_test();
+    master.mount_segment("node-a", 1024 * 1024);
+    master
+        .set_tenant_quota("test-tenant", 1024 * 1024, 0)
+        .expect("test tenant quota should be valid");
+    let store = MemoryStore::with_capacity(1024 * 1024);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let vendor = Arc::new(ModelIneligibleVendor {
+        inner: MockVendorAdapter::new_json(json!({"id":"resp_1","output_text":"uncached"})),
+        calls: Arc::clone(&calls),
+    });
+    let state = Arc::new(GatewayState::new_for_test(master, store, vendor));
+    let body = json!({"model":"gpt-test","input":"hello","temperature":0});
+
+    let first = handle_response_request(
+        &state,
+        GatewayRequest {
+            authorization: Some("Bearer test-api-key".to_owned()),
+            cache_control: None,
+            body: body.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let second = handle_response_request(
+        &state,
+        GatewayRequest {
+            authorization: Some("Bearer test-api-key".to_owned()),
+            cache_control: None,
+            body,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(first.headers["x-cache-status"], "ineligible");
+    assert_eq!(first.headers["x-cache-write"], "skipped");
+    assert_eq!(second.headers["x-cache-status"], "ineligible");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

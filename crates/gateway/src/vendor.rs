@@ -1,4 +1,4 @@
-use std::{pin::Pin, time::Duration};
+use std::{collections::BTreeMap, pin::Pin, time::Duration};
 
 use async_trait::async_trait;
 use futures_util::{stream, Stream};
@@ -6,6 +6,8 @@ use mooncache_protocol::{ResponsesRequest, SseEvent};
 use reqwest::Client;
 use serde_json::{json, Value};
 use thiserror::Error;
+
+use crate::config::VendorModelConfig;
 
 pub type VendorResponse = mooncache_protocol::ResponsesResponse;
 pub type VendorStreamEvent = SseEvent;
@@ -40,6 +42,9 @@ impl VendorError {
 pub trait VendorAdapter: Send + Sync {
     fn vendor_id(&self) -> &str;
     fn adapter_version(&self) -> &str;
+    fn model_cache_eligible(&self, _requested_model: &str) -> bool {
+        true
+    }
     async fn resolve_model_version(&self, requested_model: &str) -> Result<String, VendorError>;
     async fn complete(&self, request: ResponsesRequest) -> Result<VendorResponse, VendorError>;
     async fn stream(&self, request: ResponsesRequest) -> Result<VendorEventStream, VendorError>;
@@ -50,6 +55,8 @@ pub struct OpenAiResponsesAdapter {
     client: Client,
     base_url: String,
     api_key: String,
+    headers: BTreeMap<String, String>,
+    models: BTreeMap<String, VendorModelConfig>,
 }
 
 impl OpenAiResponsesAdapter {
@@ -57,6 +64,8 @@ impl OpenAiResponsesAdapter {
         base_url: impl Into<String>,
         api_key: String,
         timeout_ms: u64,
+        headers: BTreeMap<String, String>,
+        models: Vec<VendorModelConfig>,
     ) -> Result<Self, VendorError> {
         let base_url = base_url.into().trim_end_matches('/').to_owned();
         if base_url.is_empty() {
@@ -79,6 +88,11 @@ impl OpenAiResponsesAdapter {
             client,
             base_url,
             api_key,
+            headers,
+            models: models
+                .into_iter()
+                .map(|model| (model.requested.clone(), model))
+                .collect(),
         })
     }
 
@@ -87,10 +101,15 @@ impl OpenAiResponsesAdapter {
     }
 
     async fn post_json(&self, body: Value) -> Result<reqwest::Response, VendorError> {
-        self.client
+        let mut request = self
+            .client
             .post(self.responses_url())
             .bearer_auth(&self.api_key)
-            .json(&body)
+            .json(&body);
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
+        request
             .send()
             .await
             .map_err(|error| VendorError::Transport {
@@ -109,15 +128,24 @@ impl VendorAdapter for OpenAiResponsesAdapter {
         "openai-responses-v1"
     }
 
+    fn model_cache_eligible(&self, requested_model: &str) -> bool {
+        self.models
+            .get(requested_model)
+            .is_none_or(|model| model.cache_eligible)
+    }
+
     async fn resolve_model_version(&self, requested_model: &str) -> Result<String, VendorError> {
-        Ok(requested_model.to_owned())
+        Ok(self.models.get(requested_model).map_or_else(
+            || requested_model.to_owned(),
+            |model| model.resolved.clone(),
+        ))
     }
 
     async fn complete(&self, request: ResponsesRequest) -> Result<VendorResponse, VendorError> {
         let response = self.post_json(json!(request)).await?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = read_error_body(response).await;
             return Err(VendorError::HttpStatus {
                 status: status.as_u16(),
                 body,
@@ -141,7 +169,7 @@ impl VendorAdapter for OpenAiResponsesAdapter {
         let response = self.post_json(body).await?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = read_error_body(response).await;
             return Err(VendorError::HttpStatus {
                 status: status.as_u16(),
                 body,
@@ -156,6 +184,13 @@ impl VendorAdapter for OpenAiResponsesAdapter {
         let events = parse_sse_events(&text)?;
         Ok(Box::pin(stream::iter(events.into_iter().map(Ok))))
     }
+}
+
+async fn read_error_body(response: reqwest::Response) -> String {
+    response
+        .text()
+        .await
+        .unwrap_or_else(|error| format!("[failed to read error body: {error}]"))
 }
 
 fn parse_sse_events(text: &str) -> Result<Vec<SseEvent>, VendorError> {
@@ -307,8 +342,14 @@ mod tests {
     #[tokio::test]
     async fn openai_adapter_posts_responses_json_with_bearer_auth() {
         let (base_url, captured_request) = serve_one_response(JSON_RESPONSE).await;
-        let adapter =
-            OpenAiResponsesAdapter::new(base_url, "test-token".to_owned(), 1_000).unwrap();
+        let adapter = OpenAiResponsesAdapter::new(
+            base_url,
+            "test-token".to_owned(),
+            1_000,
+            BTreeMap::new(),
+            vec![],
+        )
+        .unwrap();
 
         let response = adapter.complete(test_request()).await.unwrap();
         let request = captured_request.await.unwrap();
@@ -318,6 +359,34 @@ mod tests {
         assert!(request.contains("authorization: Bearer test-token"));
         assert!(request.contains("\"model\":\"mock-model\""));
         assert!(request.contains("\"input\":\"hello\""));
+    }
+
+    #[tokio::test]
+    async fn openai_adapter_sends_configured_headers_and_resolves_model_aliases() {
+        let (base_url, captured_request) = serve_one_response(JSON_RESPONSE).await;
+        let adapter = OpenAiResponsesAdapter::new(
+            base_url,
+            "test-token".to_owned(),
+            1_000,
+            [("OpenAI-Beta".to_owned(), "responses=v1".to_owned())].into(),
+            vec![crate::config::VendorModelConfig {
+                requested: "mock-model".to_owned(),
+                resolved: "mock-model-2026-07-04".to_owned(),
+                cache_eligible: false,
+            }],
+        )
+        .unwrap();
+
+        let response = adapter.complete(test_request()).await.unwrap();
+        let request = captured_request.await.unwrap();
+
+        assert_eq!(response.body["output_text"], "hello");
+        assert!(request.contains("openai-beta: responses=v1"));
+        assert_eq!(
+            adapter.resolve_model_version("mock-model").await.unwrap(),
+            "mock-model-2026-07-04"
+        );
+        assert!(!adapter.model_cache_eligible("mock-model"));
     }
 
     #[tokio::test]
@@ -332,8 +401,14 @@ mod tests {
             "\n"
         ))
         .await;
-        let adapter =
-            OpenAiResponsesAdapter::new(base_url, "test-token".to_owned(), 1_000).unwrap();
+        let adapter = OpenAiResponsesAdapter::new(
+            base_url,
+            "test-token".to_owned(),
+            1_000,
+            BTreeMap::new(),
+            vec![],
+        )
+        .unwrap();
 
         let events: Vec<_> = adapter
             .stream(test_request())
@@ -359,8 +434,14 @@ mod tests {
             "rate limit"
         ))
         .await;
-        let adapter =
-            OpenAiResponsesAdapter::new(base_url, "test-token".to_owned(), 1_000).unwrap();
+        let adapter = OpenAiResponsesAdapter::new(
+            base_url,
+            "test-token".to_owned(),
+            1_000,
+            BTreeMap::new(),
+            vec![],
+        )
+        .unwrap();
 
         let err = adapter.complete(test_request()).await.unwrap_err();
         let _ = captured_request.await.unwrap();

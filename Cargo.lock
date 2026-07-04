@@ -731,6 +731,7 @@ dependencies = [
  "mooncache-master",
  "mooncache-store",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower",
 ]

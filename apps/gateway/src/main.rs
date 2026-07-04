@@ -7,9 +7,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+#[cfg(test)]
+use mooncache_gateway::MockVendorAdapter;
 use mooncache_gateway::{
     handle_response_request, GatewayError, GatewayRequest, GatewayResponse, GatewayState,
-    MockVendorAdapter,
+    OpenAiResponsesAdapter, TenantConfigSet, VendorConfigSet,
 };
 use mooncache_master::MasterState;
 use mooncache_store::MemoryStore;
@@ -164,13 +166,23 @@ async fn run_server(config: AppConfig) -> Result<(), String> {
         .local_addr()
         .map_err(|error| format!("failed to read bound address: {error}"))?;
     println!("{SERVICE_NAME} listening on {local_addr}");
-    axum::serve(listener, build_router())
+    axum::serve(listener, build_router_from_config(&config)?)
         .await
         .map_err(|error| format!("server error: {error}"))
 }
 
+#[cfg(test)]
 fn build_router() -> Router {
     let state = Arc::new(build_gateway_state());
+    router_with_state(state)
+}
+
+fn build_router_from_config(config: &AppConfig) -> Result<Router, String> {
+    let state = Arc::new(build_gateway_state_from_config(config)?);
+    Ok(router_with_state(state))
+}
+
+fn router_with_state(state: Arc<GatewayState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics/snapshot", get(metrics_snapshot))
@@ -178,6 +190,7 @@ fn build_router() -> Router {
         .with_state(state)
 }
 
+#[cfg(test)]
 fn build_gateway_state() -> GatewayState {
     let mut master = MasterState::new_for_test();
     master.mount_segment("local-store", 1_048_576);
@@ -190,6 +203,64 @@ fn build_gateway_state() -> GatewayState {
         "output_text": "hello from mooncache local gateway"
     })));
     GatewayState::new_for_test(master, store, vendor)
+}
+
+fn build_gateway_state_from_config(config: &AppConfig) -> Result<GatewayState, String> {
+    let tenants = TenantConfigSet::load(&config.tenant_config_path)
+        .map_err(|error| format!("failed to load tenant config: {error}"))?;
+    let vendors = VendorConfigSet::load(&config.vendor_config_path)
+        .map_err(|error| format!("failed to load vendor config: {error}"))?;
+    let vendor_config = vendors
+        .vendors()
+        .next()
+        .ok_or_else(|| "vendor config must contain at least one vendor".to_owned())?;
+    if vendor_config.adapter != "openai-responses" {
+        return Err(format!(
+            "unsupported vendor adapter `{}` for vendor `{}`",
+            vendor_config.adapter, vendor_config.id
+        ));
+    }
+    let api_key = env::var(&vendor_config.api_key_env).map_err(|_| {
+        format!(
+            "vendor `{}` api key env `{}` is not set",
+            vendor_config.id, vendor_config.api_key_env
+        )
+    })?;
+    let vendor = Arc::new(
+        OpenAiResponsesAdapter::new(
+            vendor_config.base_url.clone(),
+            api_key,
+            vendor_config.timeout_ms,
+            vendor_config.headers.clone(),
+            vendor_config.models.clone(),
+        )
+        .map_err(|error| format!("failed to build vendor `{}`: {error}", vendor_config.id))?,
+    );
+
+    let dram_capacity = tenants
+        .tenants()
+        .map(|tenant| tenant.dram_quota_bytes)
+        .sum::<u64>()
+        .max(1);
+    let mut master = MasterState::new_for_test();
+    master.mount_segment("local-store", dram_capacity);
+    for tenant in tenants.tenants() {
+        master
+            .set_tenant_quota(
+                tenant.id.as_str(),
+                tenant.dram_quota_bytes,
+                tenant.ssd_quota_bytes,
+            )
+            .map_err(|error| {
+                format!("invalid quota for tenant `{}`: {error}", tenant.id.as_str())
+            })?;
+    }
+    let store = MemoryStore::with_capacity(
+        usize::try_from(dram_capacity).map_err(|_| "DRAM capacity does not fit usize")?,
+    );
+    Ok(GatewayState::new_with_tenant_config(
+        master, store, vendor, tenants,
+    ))
 }
 
 async fn healthz() -> Json<Value> {
@@ -289,6 +360,42 @@ mod tests {
         http::{header, Request, StatusCode},
     };
     use serde_json::{json, Value};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    async fn serve_one_vendor_response() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let n = socket.read(&mut buffer).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..n]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n")
+                    && String::from_utf8_lossy(&request).contains("\"input\":\"from config\"")
+                {
+                    break;
+                }
+            }
+            let response_body =
+                "{\"id\":\"resp_config\",\"output_text\":\"from configured vendor\"}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (format!("http://{addr}/v1"), handle)
+    }
     use tower::ServiceExt;
 
     #[test]
@@ -411,6 +518,86 @@ mod tests {
         assert_eq!(body["id"], json!("resp_local_test"));
     }
 
+    #[tokio::test]
+    async fn config_router_authenticates_tenant_and_calls_configured_vendor() {
+        let (vendor_base_url, captured_request) = serve_one_vendor_response().await;
+        std::env::set_var("MOONCACHE_TEST_VENDOR_KEY", "configured-vendor-token");
+        let tempdir = tempfile::tempdir().unwrap();
+        let tenant_config = tempdir.path().join("tenants.toml");
+        let vendor_config = tempdir.path().join("vendors.toml");
+        std::fs::write(
+            &tenant_config,
+            r#"
+            [[tenants]]
+            id = "configured-tenant"
+            name = "Configured Tenant"
+            enabled = true
+            api_key_sha256 = "e46ea83ec368dc44797a4b7da96ad92963dae141d417cd89fdb211b488422b0f"
+            dram_quota_bytes = 1048576
+            ssd_quota_bytes = 0
+            request_rate_limit_per_minute = 1
+            stream_concurrency_limit = 1
+            vendor_spend_budget_usd = 1
+            default_ttl_seconds = 60
+            max_ttl_seconds = 60
+            policy = "cache_first"
+            allowed_vendors = ["openai"]
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            &vendor_config,
+            format!(
+                r#"
+                [[vendors]]
+                id = "openai"
+                adapter = "openai-responses"
+                adapter_version = "openai-responses-v1"
+                base_url = "{vendor_base_url}"
+                api_key_env = "MOONCACHE_TEST_VENDOR_KEY"
+                timeout_ms = 1000
+
+                [[vendors.models]]
+                requested = "gpt-test"
+                resolved = "gpt-test"
+                cache_eligible = true
+                "#
+            ),
+        )
+        .unwrap();
+        let config = AppConfig {
+            bind_addr: "127.0.0.1:0".to_owned(),
+            etcd_url: DEFAULT_ETCD_URL.to_owned(),
+            tenant_config_path: tenant_config.display().to_string(),
+            ssd_root_path: tempdir.path().join("ssd").display().to_string(),
+            metrics_bind_addr: "127.0.0.1:0".to_owned(),
+            vendor_config_path: vendor_config.display().to_string(),
+        };
+        let app = build_router_from_config(&config).expect("config router should build");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(header::AUTHORIZATION, "Bearer demo-api-key-do-not-use")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"model": "gpt-test", "input": "from config", "temperature": 0})
+                            .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("configured response request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("x-cache-status").unwrap(), "miss");
+        let body = response_json(response).await;
+        assert_eq!(body["output_text"], json!("from configured vendor"));
+        let vendor_request = captured_request.await.unwrap();
+        assert!(vendor_request.contains("authorization: Bearer configured-vendor-token"));
+    }
     async fn response_json(response: axum::response::Response) -> Value {
         let bytes = to_bytes(response.into_body(), usize::MAX)
             .await

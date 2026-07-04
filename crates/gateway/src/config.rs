@@ -164,6 +164,104 @@ impl TenantConfigSet {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VendorConfig {
+    pub id: String,
+    pub adapter: String,
+    pub adapter_version: String,
+    pub base_url: String,
+    pub api_key_env: String,
+    pub timeout_ms: u64,
+    pub headers: BTreeMap<String, String>,
+    pub models: Vec<VendorModelConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct VendorModelConfig {
+    pub requested: String,
+    pub resolved: String,
+    pub cache_eligible: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct VendorConfigSet {
+    vendors: BTreeMap<String, VendorConfig>,
+}
+
+impl VendorConfigSet {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let path = path.as_ref();
+        let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
+        Self::parse_toml(&text)
+    }
+
+    pub fn parse_toml(text: &str) -> Result<Self, ConfigError> {
+        let raw: RawVendorConfigFile = toml::from_str(text)?;
+        if raw.vendors.is_empty() {
+            return Err(ConfigError::Invalid(
+                "vendor config must contain at least one vendor".into(),
+            ));
+        }
+
+        let mut vendors = BTreeMap::new();
+        for raw_vendor in raw.vendors {
+            validate_non_empty(&raw_vendor.id, "vendor id")?;
+            validate_non_empty(&raw_vendor.adapter, "vendor adapter")?;
+            validate_non_empty(&raw_vendor.adapter_version, "vendor adapter_version")?;
+            validate_non_empty(&raw_vendor.base_url, "vendor base_url")?;
+            validate_non_empty(&raw_vendor.api_key_env, "vendor api_key_env")?;
+            if raw_vendor.timeout_ms == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "vendor `{}` timeout_ms must be greater than zero",
+                    raw_vendor.id
+                )));
+            }
+            if raw_vendor.models.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "vendor `{}` must define at least one model",
+                    raw_vendor.id
+                )));
+            }
+            for model in &raw_vendor.models {
+                validate_non_empty(&model.requested, "vendor model requested")?;
+                validate_non_empty(&model.resolved, "vendor model resolved")?;
+            }
+
+            let config = VendorConfig {
+                id: raw_vendor.id.clone(),
+                adapter: raw_vendor.adapter,
+                adapter_version: raw_vendor.adapter_version,
+                base_url: raw_vendor.base_url,
+                api_key_env: raw_vendor.api_key_env,
+                timeout_ms: raw_vendor.timeout_ms,
+                headers: raw_vendor.headers,
+                models: raw_vendor.models,
+            };
+
+            if vendors.insert(raw_vendor.id.clone(), config).is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate vendor id `{}`",
+                    raw_vendor.id
+                )));
+            }
+        }
+
+        Ok(Self { vendors })
+    }
+
+    #[must_use]
+    pub fn vendor(&self, vendor_id: &str) -> Option<&VendorConfig> {
+        self.vendors.get(vendor_id)
+    }
+
+    pub fn vendors(&self) -> impl Iterator<Item = &VendorConfig> {
+        self.vendors.values()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawTenantConfigFile {
     tenants: Vec<RawTenantConfig>,
@@ -186,6 +284,25 @@ struct RawTenantConfig {
     allowed_vendors: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawVendorConfigFile {
+    vendors: Vec<RawVendorConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawVendorConfig {
+    id: String,
+    adapter: String,
+    adapter_version: String,
+    base_url: String,
+    api_key_env: String,
+    timeout_ms: u64,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    models: Vec<VendorModelConfig>,
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
@@ -194,6 +311,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
         write!(&mut out, "{byte:02x}").expect("writing to String should not fail");
     }
     out
+}
+
+fn validate_non_empty(value: &str, field: &str) -> Result<(), ConfigError> {
+    if value.trim().is_empty() {
+        Err(ConfigError::Invalid(format!("{field} must not be empty")))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_sha256(value: &str) -> Result<(), ConfigError> {
@@ -224,6 +349,7 @@ mod tests {
             enabled = true
             api_key_sha256 = "1a134f3f350c91084f57eb135752d773e992a1271f0fe658d441b8e45d064f3b"
             dram_quota_bytes = 1073741824
+
             ssd_quota_bytes = 10737418240
             request_rate_limit_per_minute = 12000
             stream_concurrency_limit = 80
@@ -242,6 +368,34 @@ mod tests {
         assert_eq!(tenant.dram_quota_bytes, 1_073_741_824);
         assert_eq!(tenant.ssd_quota_bytes, 10_737_418_240);
         assert_eq!(tenant.allowed_vendors, ["openai"]);
+    }
+
+    #[test]
+    fn parses_openai_vendor_with_model_aliases() {
+        let config = VendorConfigSet::parse_toml(
+            r#"
+            [[vendors]]
+            id = "openai"
+            adapter = "openai-responses"
+            adapter_version = "openai-responses-v1"
+            base_url = "https://api.openai.com/v1"
+            api_key_env = "OPENAI_API_KEY"
+            timeout_ms = 30000
+            headers = { "OpenAI-Beta" = "responses=v1" }
+
+            [[vendors.models]]
+            requested = "gpt-4.1"
+            resolved = "gpt-4.1"
+            cache_eligible = true
+            "#,
+        )
+        .unwrap();
+
+        let vendor = config.vendor("openai").unwrap();
+        assert_eq!(vendor.adapter, "openai-responses");
+        assert_eq!(vendor.adapter_version, "openai-responses-v1");
+        assert_eq!(vendor.timeout_ms, 30_000);
+        assert_eq!(vendor.models[0].requested, "gpt-4.1");
     }
 
     #[test]

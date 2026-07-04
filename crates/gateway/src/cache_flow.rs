@@ -116,6 +116,15 @@ impl GatewayState {
         (token == TEST_API_KEY).then(|| self.tenant_id.clone())
     }
 
+    fn tenant_allows_vendor(&self, tenant_id: &TenantId, vendor_id: &str) -> bool {
+        let Some(configs) = &self.tenant_configs else {
+            return true;
+        };
+        configs
+            .tenant(tenant_id.as_str())
+            .is_some_and(|tenant| tenant.allowed_vendors.iter().any(|id| id == vendor_id))
+    }
+
     fn master(&self) -> Result<MutexGuard<'_, MasterState>, GatewayError> {
         self.master.lock().map_err(|_| GatewayError::PoisonedLock)
     }
@@ -182,6 +191,16 @@ pub async fn handle_response_request(
             "none",
         ));
     };
+    if !state.tenant_allows_vendor(&tenant_id, state.vendor.vendor_id()) {
+        record_simple(CacheStatus::Bypass, CacheWriteStatus::Skipped);
+        return Ok(GatewayResponse::error(
+            403,
+            "tenant is not allowed to use configured vendor",
+            CacheStatus::Bypass,
+            CacheWriteStatus::Skipped.as_header_value(),
+            "none",
+        ));
+    }
 
     let cache_control = match CacheControl::parse(cache_control.unwrap_or_default()) {
         Ok(control) => control,
@@ -205,7 +224,13 @@ pub async fn handle_response_request(
         .resolve_model_version(&vendor_request.model)
         .await?;
     let force_replay = matches!(cache_control, CacheControl::ForceReplay);
-    let eligibility = classify_request(&body, force_replay);
+    let eligibility = if state.vendor.model_cache_eligible(&vendor_request.model) {
+        classify_request(&body, force_replay)
+    } else {
+        EligibilityDecision::Bypass {
+            reason: "model is not cache eligible".to_owned(),
+        }
+    };
     let fingerprint_body = fingerprint_body_without_stream(&body);
     let cache_key = compute_cache_key(&FingerprintInput {
         tenant_id: &tenant_id,
