@@ -18,6 +18,7 @@ use mooncache_store::{ChunkHandle, MemoryStore, StoreError};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::config::TenantConfigSet;
 use crate::routes::GatewayResponse;
 use crate::singleflight::{
     SingleflightGroup, SingleflightKey, SingleflightStart, SingleflightWriteMode,
@@ -35,6 +36,7 @@ pub struct GatewayState {
     store: Mutex<MemoryStore>,
     vendor: Arc<dyn VendorAdapter>,
     tenant_id: TenantId,
+    tenant_configs: Option<TenantConfigSet>,
     singleflight: SingleflightGroup,
     metrics: GatewayMetrics,
     cache_available: bool,
@@ -52,6 +54,34 @@ impl GatewayState {
             store: Mutex::new(store),
             vendor,
             tenant_id,
+            tenant_configs: None,
+            singleflight: SingleflightGroup::default(),
+            metrics: GatewayMetrics::default(),
+            cache_available: true,
+        }
+    }
+
+    #[must_use]
+    pub fn new_with_tenant_config<V>(
+        master: MasterState,
+        store: MemoryStore,
+        vendor: Arc<V>,
+        tenant_configs: TenantConfigSet,
+    ) -> Self
+    where
+        V: VendorAdapter + 'static,
+    {
+        let tenant_id = tenant_configs
+            .tenants()
+            .next()
+            .map(|tenant| tenant.id.clone())
+            .unwrap_or_else(|| TenantId::parse(TEST_TENANT_ID).expect("test tenant id is valid"));
+        Self {
+            master: Mutex::new(master),
+            store: Mutex::new(store),
+            vendor,
+            tenant_id,
+            tenant_configs: Some(tenant_configs),
             singleflight: SingleflightGroup::default(),
             metrics: GatewayMetrics::default(),
             cache_available: true,
@@ -69,6 +99,7 @@ impl GatewayState {
             store: Mutex::new(MemoryStore::with_capacity(0)),
             vendor,
             tenant_id,
+            tenant_configs: None,
             singleflight: SingleflightGroup::default(),
             metrics: GatewayMetrics::default(),
             cache_available: false,
@@ -77,6 +108,11 @@ impl GatewayState {
 
     fn authenticate(&self, authorization: Option<&str>) -> Option<TenantId> {
         let token = authorization?.strip_prefix("Bearer ")?;
+        if let Some(configs) = &self.tenant_configs {
+            return configs
+                .tenant_for_bearer_token(token)
+                .map(|tenant| tenant.id.clone());
+        }
         (token == TEST_API_KEY).then(|| self.tenant_id.clone())
     }
 

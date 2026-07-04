@@ -9,8 +9,8 @@ use std::{
 use async_trait::async_trait;
 use futures_util::FutureExt;
 use mooncache_gateway::{
-    handle_response_request, GatewayRequest, GatewayState, MockVendorAdapter, VendorAdapter,
-    VendorError, VendorEventStream, VendorResponse,
+    handle_response_request, GatewayRequest, GatewayState, MockVendorAdapter, TenantConfigSet,
+    VendorAdapter, VendorError, VendorEventStream, VendorResponse,
 };
 use mooncache_master::MasterState;
 use mooncache_protocol::ResponsesRequest;
@@ -296,6 +296,56 @@ async fn post_response_result_for_state(
         headers: response.headers,
         body: response.body,
     })
+}
+
+#[tokio::test]
+async fn configured_api_key_authenticates_configured_tenant() {
+    let tenants = TenantConfigSet::parse_toml(
+        r#"
+        [[tenants]]
+        id = "configured-tenant"
+        name = "Configured Tenant"
+        enabled = true
+        api_key_sha256 = "e46ea83ec368dc44797a4b7da96ad92963dae141d417cd89fdb211b488422b0f"
+        dram_quota_bytes = 1048576
+        ssd_quota_bytes = 0
+        request_rate_limit_per_minute = 1
+        stream_concurrency_limit = 1
+        vendor_spend_budget_usd = 1
+        default_ttl_seconds = 60
+        max_ttl_seconds = 60
+        policy = "cache_first"
+        allowed_vendors = ["mock"]
+        "#,
+    )
+    .unwrap();
+    let mut master = MasterState::new_for_test();
+    master.mount_segment("node-a", 1024 * 1024);
+    master
+        .set_tenant_quota("configured-tenant", 1024 * 1024, 0)
+        .expect("configured tenant quota should be valid");
+    let store = MemoryStore::with_capacity(1024 * 1024);
+    let vendor = Arc::new(MockVendorAdapter::new_json(
+        json!({"id":"resp_configured","output_text":"configured"}),
+    ));
+    let state = Arc::new(GatewayState::new_with_tenant_config(
+        master, store, vendor, tenants,
+    ));
+
+    let response = handle_response_request(
+        &state,
+        GatewayRequest {
+            authorization: Some("Bearer demo-api-key-do-not-use".to_owned()),
+            cache_control: None,
+            body: json!({"model":"gpt-test","input":"hello","temperature":0}),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status_code, 200);
+    assert_eq!(response.headers["x-cache-status"], "miss");
+    assert_eq!(response.body["output_text"], "configured");
 }
 
 #[tokio::test]

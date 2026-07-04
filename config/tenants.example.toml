@@ -8,7 +8,7 @@ enabled = true
 
 # API keys are stored as SHA-256 hex digests of the plaintext bearer token.
 # Example plaintext for this digest: "demo-api-key-do-not-use"
-api_key_sha256 = "1a134f3f350c91084f57eb135752d773e992a1271f0fe658d441b8e45d064f3b"
+api_key_sha256 = "e46ea83ec368dc44797a4b7da96ad92963dae141d417cd89fdb211b488422b0f"
 
 # Cache capacity and request controls for this tenant.
 dram_quota_bytes = 1073741824

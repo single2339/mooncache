@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, fs, path::Path};
 
 use mooncache_common::TenantId;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -150,6 +151,14 @@ impl TenantConfigSet {
         self.tenants.get(tenant_id)
     }
 
+    #[must_use]
+    pub fn tenant_for_bearer_token(&self, token: &str) -> Option<&TenantConfig> {
+        let digest = sha256_hex(token.as_bytes());
+        self.tenants
+            .values()
+            .find(|tenant| tenant.enabled && tenant.api_key_sha256 == digest)
+    }
+
     pub fn tenants(&self) -> impl Iterator<Item = &TenantConfig> {
         self.tenants.values()
     }
@@ -175,6 +184,16 @@ struct RawTenantConfig {
     max_ttl_seconds: u64,
     policy: TenantCachePolicy,
     allowed_vendors: Vec<String>,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut out, "{byte:02x}").expect("writing to String should not fail");
+    }
+    out
 }
 
 fn validate_sha256(value: &str) -> Result<(), ConfigError> {
@@ -223,6 +242,62 @@ mod tests {
         assert_eq!(tenant.dram_quota_bytes, 1_073_741_824);
         assert_eq!(tenant.ssd_quota_bytes, 10_737_418_240);
         assert_eq!(tenant.allowed_vendors, ["openai"]);
+    }
+
+    #[test]
+    fn authenticates_enabled_tenant_by_bearer_token_digest() {
+        let config = TenantConfigSet::parse_toml(
+            r#"
+            [[tenants]]
+            id = "demo-tenant"
+            name = "Demo Tenant"
+            enabled = true
+            api_key_sha256 = "e46ea83ec368dc44797a4b7da96ad92963dae141d417cd89fdb211b488422b0f"
+            dram_quota_bytes = 1
+            ssd_quota_bytes = 0
+            request_rate_limit_per_minute = 1
+            stream_concurrency_limit = 1
+            vendor_spend_budget_usd = 1
+            default_ttl_seconds = 60
+            max_ttl_seconds = 60
+            policy = "cache_first"
+            allowed_vendors = ["openai"]
+            "#,
+        )
+        .unwrap();
+
+        let tenant = config
+            .tenant_for_bearer_token("demo-api-key-do-not-use")
+            .unwrap();
+
+        assert_eq!(tenant.id.as_str(), "demo-tenant");
+    }
+
+    #[test]
+    fn authentication_ignores_disabled_tenants() {
+        let config = TenantConfigSet::parse_toml(
+            r#"
+            [[tenants]]
+            id = "disabled-tenant"
+            name = "Disabled Tenant"
+            enabled = false
+            api_key_sha256 = "e46ea83ec368dc44797a4b7da96ad92963dae141d417cd89fdb211b488422b0f"
+            dram_quota_bytes = 1
+            ssd_quota_bytes = 0
+            request_rate_limit_per_minute = 1
+            stream_concurrency_limit = 1
+            vendor_spend_budget_usd = 1
+            default_ttl_seconds = 60
+            max_ttl_seconds = 60
+            policy = "cache_first"
+            allowed_vendors = ["openai"]
+            "#,
+        )
+        .unwrap();
+
+        assert!(config
+            .tenant_for_bearer_token("demo-api-key-do-not-use")
+            .is_none());
     }
 
     #[test]
