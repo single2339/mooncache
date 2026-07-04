@@ -6,3 +6,11 @@ license.workspace = true
 
 [dependencies]
 mooncache-gateway = { path = "../../crates/gateway" }
+mooncache-master = { path = "../../crates/master" }
+mooncache-store = { path = "../../crates/store" }
+axum.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tower.workspace = true

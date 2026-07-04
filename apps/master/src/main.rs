@@ -1,5 +1,9 @@
-use std::env;
-use std::process::ExitCode;
+use std::{env, process::ExitCode, sync::Arc};
+
+use axum::{extract::State, routing::get, Json, Router};
+use mooncache_master::MasterState;
+use serde_json::{json, Value};
+use tokio::net::TcpListener;
 
 const SERVICE_NAME: &str = "mooncache-master";
 const SERVICE_ENV_PREFIX: &str = "MOONCACHE_MASTER";
@@ -26,16 +30,20 @@ enum ParsedConfig {
     Run(AppConfig),
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     match parse_config(env::args().skip(1).collect()) {
         Ok(ParsedConfig::Help) => {
             print!("{}", usage());
             ExitCode::SUCCESS
         }
-        Ok(ParsedConfig::Run(config)) => {
-            print_resolved_config(&config);
-            ExitCode::SUCCESS
-        }
+        Ok(ParsedConfig::Run(config)) => match run_server(config).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Err(error) => {
             eprintln!("error: {error}\n\n{}", usage());
             ExitCode::from(2)
@@ -136,9 +144,45 @@ fn print_resolved_config(config: &AppConfig) {
     );
 }
 
+async fn run_server(config: AppConfig) -> Result<(), String> {
+    print_resolved_config(&config);
+    let listener = TcpListener::bind(&config.bind_addr)
+        .await
+        .map_err(|error| format!("failed to bind {}: {error}", config.bind_addr))?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|error| format!("failed to read bound address: {error}"))?;
+    println!("{SERVICE_NAME} listening on {local_addr}");
+    axum::serve(listener, build_router())
+        .await
+        .map_err(|error| format!("server error: {error}"))
+}
+
+fn build_router() -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/metrics/snapshot", get(metrics_snapshot))
+        .with_state(Arc::new(MasterState::new_for_test()))
+}
+
+async fn healthz() -> Json<Value> {
+    Json(json!({"ok": true, "service": SERVICE_NAME}))
+}
+
+async fn metrics_snapshot(State(state): State<Arc<MasterState>>) -> Json<Value> {
+    Json(json!(state.observability_snapshot()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
 
     #[test]
     fn cli_flags_override_defaults() {
@@ -181,5 +225,46 @@ mod tests {
             parse_config(vec!["--bind-addr".to_string()]).expect_err("missing value should fail");
 
         assert_eq!(error, "--bind-addr requires a value");
+    }
+
+    #[tokio::test]
+    async fn http_router_serves_health_and_master_snapshot() {
+        let app = build_router();
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("health request should complete");
+        assert_eq!(health.status(), StatusCode::OK);
+        let health_body = response_json(health).await;
+        assert_eq!(health_body["ok"], json!(true));
+        assert_eq!(health_body["service"], json!(SERVICE_NAME));
+
+        let snapshot = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics/snapshot")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("snapshot request should complete");
+        assert_eq!(snapshot.status(), StatusCode::OK);
+        let snapshot_body = response_json(snapshot).await;
+        assert_eq!(snapshot_body["objects_total"], json!(0));
+        assert_eq!(snapshot_body["evictions_total"], json!(0));
+    }
+
+    async fn response_json(response: axum::response::Response) -> Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        serde_json::from_slice(&bytes).expect("body should be JSON")
     }
 }

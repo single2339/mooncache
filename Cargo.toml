@@ -26,6 +26,8 @@ thiserror = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chacha20poly1305 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread"] }
 async-trait = "0.1"
 futures-util = "0.3"
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }

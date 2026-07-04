@@ -21,6 +21,7 @@ pub struct TestCluster {
     vendor_calls: Arc<AtomicUsize>,
 }
 
+#[allow(dead_code)]
 impl TestCluster {
     pub async fn with_vendor_body(body: Value) -> Self {
         Self::with_yielding_vendor_body(body, 0).await

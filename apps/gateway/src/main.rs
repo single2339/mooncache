@@ -1,5 +1,20 @@
-use std::env;
-use std::process::ExitCode;
+use std::{env, process::ExitCode, sync::Arc};
+
+use axum::{
+    extract::State,
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use mooncache_gateway::{
+    handle_response_request, GatewayError, GatewayRequest, GatewayResponse, GatewayState,
+    MockVendorAdapter,
+};
+use mooncache_master::MasterState;
+use mooncache_store::MemoryStore;
+use serde_json::{json, Value};
+use tokio::net::TcpListener;
 
 const SERVICE_NAME: &str = "mooncache-gateway";
 const SERVICE_ENV_PREFIX: &str = "MOONCACHE_GATEWAY";
@@ -26,16 +41,20 @@ enum ParsedConfig {
     Run(AppConfig),
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     match parse_config(env::args().skip(1).collect()) {
         Ok(ParsedConfig::Help) => {
             print!("{}", usage());
             ExitCode::SUCCESS
         }
-        Ok(ParsedConfig::Run(config)) => {
-            print_resolved_config(&config);
-            ExitCode::SUCCESS
-        }
+        Ok(ParsedConfig::Run(config)) => match run_server(config).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        },
         Err(error) => {
             eprintln!("error: {error}\n\n{}", usage());
             ExitCode::from(2)
@@ -136,9 +155,141 @@ fn print_resolved_config(config: &AppConfig) {
     );
 }
 
+async fn run_server(config: AppConfig) -> Result<(), String> {
+    print_resolved_config(&config);
+    let listener = TcpListener::bind(&config.bind_addr)
+        .await
+        .map_err(|error| format!("failed to bind {}: {error}", config.bind_addr))?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|error| format!("failed to read bound address: {error}"))?;
+    println!("{SERVICE_NAME} listening on {local_addr}");
+    axum::serve(listener, build_router())
+        .await
+        .map_err(|error| format!("server error: {error}"))
+}
+
+fn build_router() -> Router {
+    let state = Arc::new(build_gateway_state());
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/metrics/snapshot", get(metrics_snapshot))
+        .route("/v1/responses", post(responses))
+        .with_state(state)
+}
+
+fn build_gateway_state() -> GatewayState {
+    let mut master = MasterState::new_for_test();
+    master.mount_segment("local-store", 1_048_576);
+    master
+        .set_tenant_quota("test-tenant", 1_048_576, 0)
+        .expect("local tenant quota should be valid");
+    let store = MemoryStore::with_capacity(1_048_576);
+    let vendor = Arc::new(MockVendorAdapter::new_json(json!({
+        "id": "resp_local_test",
+        "output_text": "hello from mooncache local gateway"
+    })));
+    GatewayState::new_for_test(master, store, vendor)
+}
+
+async fn healthz() -> Json<Value> {
+    Json(json!({"ok": true, "service": SERVICE_NAME}))
+}
+
+async fn metrics_snapshot(State(state): State<Arc<GatewayState>>) -> Json<Value> {
+    Json(json!(state.metrics_snapshot()))
+}
+
+async fn responses(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let authorization = match optional_header(&headers, header::AUTHORIZATION.as_str()) {
+        Ok(value) => value,
+        Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+    };
+    let cache_control = match optional_header(&headers, "x-cache-control") {
+        Ok(Some(value)) => Some(value),
+        Ok(None) => match optional_header(&headers, header::CACHE_CONTROL.as_str()) {
+            Ok(value) => value,
+            Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+        },
+        Err(message) => return json_error(StatusCode::BAD_REQUEST, message),
+    };
+
+    match handle_response_request(
+        &state,
+        GatewayRequest {
+            authorization,
+            cache_control,
+            body,
+        },
+    )
+    .await
+    {
+        Ok(response) => gateway_http_response(response),
+        Err(error) => gateway_error_response(error),
+    }
+}
+
+fn optional_header(headers: &HeaderMap, name: &str) -> Result<Option<String>, String> {
+    headers
+        .get(name)
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| format!("header `{name}` must be valid UTF-8"))
+        })
+        .transpose()
+}
+
+fn gateway_http_response(response: GatewayResponse) -> Response {
+    let status =
+        StatusCode::from_u16(response.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut http_response = (status, Json(response.body)).into_response();
+    for (name, value) in response.headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            http_response.headers_mut().insert(name, value);
+        }
+    }
+    http_response
+}
+
+fn gateway_error_response(error: GatewayError) -> Response {
+    let status = match error {
+        GatewayError::Json(_) => StatusCode::BAD_REQUEST,
+        GatewayError::Vendor(_) => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    json_error(status, error.to_string())
+}
+
+fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(json!({
+            "ok": false,
+            "error": message.into()
+        })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use axum::{
+        body::{to_bytes, Body},
+        http::{header, Request, StatusCode},
+    };
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
 
     #[test]
     fn cli_flags_override_defaults() {
@@ -181,5 +332,89 @@ mod tests {
             parse_config(vec!["--bind-addr".to_string()]).expect_err("missing value should fail");
 
         assert_eq!(error, "--bind-addr requires a value");
+    }
+
+    #[tokio::test]
+    async fn http_router_serves_health_and_responses() {
+        let app = build_router();
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("health request should complete");
+        assert_eq!(health.status(), StatusCode::OK);
+        let health_body = response_json(health).await;
+        assert_eq!(health_body["ok"], json!(true));
+        assert_eq!(health_body["service"], json!(SERVICE_NAME));
+
+        let cacheable_body = json!({"model": "gpt-test", "input": "cache me"});
+        let miss = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(header::AUTHORIZATION, "Bearer test-api-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(cacheable_body.to_string()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("cache miss request should complete");
+        assert_eq!(miss.status(), StatusCode::OK);
+        assert_eq!(miss.headers().get("x-cache-status").unwrap(), "miss");
+        assert_eq!(miss.headers().get("x-cache-write").unwrap(), "committed");
+
+        let hit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(header::AUTHORIZATION, "Bearer test-api-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(cacheable_body.to_string()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("cache hit request should complete");
+        assert_eq!(hit.status(), StatusCode::OK);
+        assert_eq!(hit.headers().get("x-cache-status").unwrap(), "hit");
+        assert_eq!(hit.headers().get("x-cache-write").unwrap(), "skipped");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(header::AUTHORIZATION, "Bearer test-api-key")
+                    .header("x-cache-control", "bypass")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"model": "gpt-test", "input": "hello"}).to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("x-cache-status").unwrap(), "bypass");
+        assert_eq!(response.headers().get("x-cache-write").unwrap(), "skipped");
+        let body = response_json(response).await;
+        assert_eq!(body["id"], json!("resp_local_test"));
+    }
+
+    async fn response_json(response: axum::response::Response) -> Value {
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        serde_json::from_slice(&bytes).expect("body should be JSON")
     }
 }
