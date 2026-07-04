@@ -1,0 +1,37 @@
+[package]
+name = "mooncache-gateway"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mooncache-protocol = { path = "../protocol" }
+async-trait.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+mooncache-common = { path = "../common" }
+mooncache-fingerprint = { path = "../fingerprint" }
+mooncache-master = { path = "../master" }
+mooncache-store = { path = "../store" }
+tokio = { workspace = true, features = ["sync"] }
+[dev-dependencies]
+tokio.workspace = true
+
+[[test]]
+name = "cache_flow"
+path = "../../tests/integration/cache_flow.rs"
+
+[[test]]
+name = "streaming_flow"
+path = "../../tests/integration/streaming_flow.rs"
+
+[[test]]
+name = "e2e_cluster"
+path = "../../tests/integration/e2e_cluster.rs"
+
+[[test]]
+name = "load_smoke"
+path = "../../tests/integration/load_smoke.rs"

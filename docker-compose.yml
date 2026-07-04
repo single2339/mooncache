@@ -1,0 +1,162 @@
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    command:
+      - /usr/local/bin/etcd
+      - --name=mooncache-etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --initial-cluster=mooncache-etcd=http://etcd:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=mooncache-dev
+    ports:
+      - "2379:2379"
+    volumes:
+      - etcd-data:/etcd-data
+    healthcheck:
+      test: ["CMD-SHELL", "ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  master:
+    image: rust:1.88-bookworm
+    working_dir: /workspace
+    command:
+      - cargo
+      - run
+      - -p
+      - mooncache-master-app
+      - --
+      - --bind-addr=0.0.0.0:8081
+      - --metrics-bind-addr=0.0.0.0:9091
+      - --etcd-url=http://etcd:2379
+      - --tenant-config=/workspace/config/tenants.toml
+      - --ssd-root=/var/lib/mooncache/ssd
+      - --vendor-config=/workspace/config/vendors.toml
+    environment:
+      MOONCACHE_MASTER_ETCD_URL: http://etcd:2379
+    ports:
+      - "8081:8081"
+      - "9091:9091"
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/workspace/target
+    depends_on:
+      etcd:
+        condition: service_healthy
+
+  store-node:
+    image: rust:1.88-bookworm
+    working_dir: /workspace
+    command:
+      - cargo
+      - run
+      - -p
+      - mooncache-store-node-app
+      - --
+      - --bind-addr=0.0.0.0:8082
+      - --metrics-bind-addr=0.0.0.0:9092
+      - --etcd-url=http://etcd:2379
+      - --tenant-config=/workspace/config/tenants.toml
+      - --ssd-root=/var/lib/mooncache/ssd
+      - --vendor-config=/workspace/config/vendors.toml
+    environment:
+      MOONCACHE_STORE_NODE_ETCD_URL: http://etcd:2379
+      MOONCACHE_STORE_NODE_SSD_ROOT: /var/lib/mooncache/ssd
+    ports:
+      - "8082:8082"
+      - "9092:9092"
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/workspace/target
+      - store-node-ssd:/var/lib/mooncache/ssd
+    depends_on:
+      etcd:
+        condition: service_healthy
+      master:
+        condition: service_started
+
+  gateway:
+    image: rust:1.88-bookworm
+    working_dir: /workspace
+    command:
+      - cargo
+      - run
+      - -p
+      - mooncache-gateway-app
+      - --
+      - --bind-addr=0.0.0.0:8080
+      - --metrics-bind-addr=0.0.0.0:9090
+      - --etcd-url=http://etcd:2379
+      - --tenant-config=/workspace/config/tenants.toml
+      - --ssd-root=/var/lib/mooncache/ssd
+      - --vendor-config=/workspace/config/vendors.toml
+    environment:
+      MOONCACHE_GATEWAY_ETCD_URL: http://etcd:2379
+      MOONCACHE_GATEWAY_VENDOR_CONFIG: /workspace/config/vendors.toml
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/workspace/target
+    depends_on:
+      etcd:
+        condition: service_healthy
+      master:
+        condition: service_started
+      store-node:
+        condition: service_started
+
+  admin-api:
+    image: rust:1.88-bookworm
+    working_dir: /workspace
+    command:
+      - cargo
+      - run
+      - -p
+      - mooncache-admin-api-app
+      - --
+      - --bind-addr=0.0.0.0:8083
+      - --metrics-bind-addr=0.0.0.0:9093
+      - --etcd-url=http://etcd:2379
+      - --tenant-config=/workspace/config/tenants.toml
+      - --ssd-root=/var/lib/mooncache/ssd
+      - --vendor-config=/workspace/config/vendors.toml
+    environment:
+      MOONCACHE_ADMIN_API_ETCD_URL: http://etcd:2379
+    ports:
+      - "8083:8083"
+      - "9093:9093"
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-target:/workspace/target
+    depends_on:
+      etcd:
+        condition: service_healthy
+      master:
+        condition: service_started
+
+  control-panel:
+    image: nginx:1.27-alpine
+    ports:
+      - "3000:80"
+    volumes:
+      - ./control-panel/dist:/usr/share/nginx/html:ro
+    depends_on:
+      admin-api:
+        condition: service_started
+
+volumes:
+  etcd-data:
+  store-node-ssd:
+  cargo-registry:
+  cargo-target:

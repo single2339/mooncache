@@ -1,0 +1,11 @@
+[package]
+name = "mooncache-fingerprint"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mooncache-common = { path = "../common" }
+mooncache-protocol = { path = "../protocol" }
+serde_json.workspace = true
+sha2.workspace = true
