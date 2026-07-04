@@ -94,11 +94,15 @@ services:
       - --bind-addr=0.0.0.0:8080
       - --metrics-bind-addr=0.0.0.0:9090
       - --etcd-url=http://etcd:2379
+      - --master-url=http://master:8081
+      - --store-nodes=default=http://store-node:8082
       - --tenant-config=/workspace/config/tenants.toml
       - --ssd-root=/var/lib/mooncache/ssd
       - --vendor-config=/workspace/config/vendors.toml
     environment:
       MOONCACHE_GATEWAY_ETCD_URL: http://etcd:2379
+      MOONCACHE_GATEWAY_MASTER_URL: http://master:8081
+      MOONCACHE_GATEWAY_STORE_NODES: default=http://store-node:8082
       MOONCACHE_GATEWAY_VENDOR_CONFIG: /workspace/config/vendors.toml
     ports:
       - "8080:8080"
