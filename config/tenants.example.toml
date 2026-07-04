@@ -1,0 +1,30 @@
+# Mooncache tenant configuration example.
+# Copy to tenants.toml for local development and replace all placeholder secrets.
+
+[[tenants]]
+id = "demo-tenant"
+name = "Demo Tenant"
+enabled = true
+
+# API keys are stored as SHA-256 hex digests of the plaintext bearer token.
+# Example plaintext for this digest: "demo-api-key-do-not-use"
+api_key_sha256 = "1a134f3f350c91084f57eb135752d773e992a1271f0fe658d441b8e45d064f3b"
+
+# Cache capacity and request controls for this tenant.
+dram_quota_bytes = 1073741824
+ssd_quota_bytes = 10737418240
+request_rate_limit_per_minute = 12000
+stream_concurrency_limit = 80
+vendor_spend_budget_usd = 5000
+
+# Default object lifetime; later requests may override within policy bounds.
+default_ttl_seconds = 86400
+max_ttl_seconds = 604800
+
+# cache_first: normal read-through/writeback behavior.
+# bypass: always call vendor and skip writeback unless request opts in later.
+# cache_only: never call vendor on miss.
+policy = "cache_first"
+
+# Strict allow-list of vendors this tenant may call.
+allowed_vendors = ["openai"]

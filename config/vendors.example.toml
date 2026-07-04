@@ -1,0 +1,24 @@
+# Mooncache vendor configuration example.
+# Copy to vendors.toml for local development and provide real credentials through env.
+
+[[vendors]]
+id = "openai"
+adapter = "openai-responses"
+adapter_version = "openai-responses-v1"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+timeout_ms = 30000
+
+# Optional default headers copied to outbound vendor calls.
+# Do not put secrets here; use api_key_env for credentials.
+headers = { "OpenAI-Beta" = "responses=v1" }
+
+[[vendors.models]]
+requested = "gpt-4.1"
+resolved = "gpt-4.1"
+cache_eligible = true
+
+[[vendors.models]]
+requested = "gpt-4.1-mini"
+resolved = "gpt-4.1-mini"
+cache_eligible = true
