@@ -1,12 +1,13 @@
-use std::{env, process::ExitCode, sync::Arc};
+use std::{collections::HashMap, env, path::Path, process::ExitCode, sync::Arc};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     routing::get,
     Json, Router,
 };
-use mooncache_store::{ChunkHandle, MemoryStore, StoreError};
+use mooncache_common::StoreCapacitySnapshot;
+use mooncache_store::{ChunkHandle, MemoryStore, SsdError, SsdStore, StoreError};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -37,7 +38,14 @@ enum ParsedConfig {
     Run(AppConfig),
 }
 
-type AppState = Arc<Mutex<MemoryStore>>;
+type AppState = Arc<StoreNodeState>;
+
+struct StoreNodeState {
+    dram: Mutex<MemoryStore>,
+    ssd: Option<SsdStore>,
+    ssd_objects: Mutex<HashMap<(String, String), usize>>,
+    ssd_bytes_capacity: u64,
+}
 
 // ── DTOs ────────────────────────────────────────────────────────
 
@@ -46,11 +54,20 @@ struct WriteChunkRequest {
     len: usize,
     data: Vec<u8>,
 }
+
 #[derive(Debug, Deserialize)]
 struct PreallocatedWriteRequest {
+    tenant_id: Option<String>,
+    cache_key: Option<String>,
     offset: usize,
     len: usize,
     data: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadChunkQuery {
+    tenant_id: Option<String>,
+    cache_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -64,6 +81,7 @@ struct WriteChunkResponse {
 struct ReadChunkResponse {
     offset: usize,
     len: usize,
+    tier: &'static str,
     data: Vec<u8>,
 }
 
@@ -163,6 +181,143 @@ fn required_value(value: &str, flag: &str) -> Result<String, String> {
     }
 }
 
+impl StoreNodeState {
+    #[cfg(test)]
+    fn memory_only(dram_capacity: usize) -> Self {
+        Self {
+            dram: Mutex::new(MemoryStore::with_capacity(dram_capacity)),
+            ssd: None,
+            ssd_objects: Mutex::new(HashMap::new()),
+            ssd_bytes_capacity: 0,
+        }
+    }
+
+    async fn with_ssd(
+        dram_capacity: usize,
+        ssd_root: impl AsRef<Path>,
+        ssd_bytes_capacity: u64,
+        ssd_key: &[u8],
+    ) -> Result<Self, SsdError> {
+        let ssd = SsdStore::new_with_key(ssd_root, ssd_key).await?;
+        Ok(Self {
+            dram: Mutex::new(MemoryStore::with_capacity(dram_capacity)),
+            ssd: Some(ssd),
+            ssd_objects: Mutex::new(HashMap::new()),
+            ssd_bytes_capacity,
+        })
+    }
+
+    fn capacity_snapshot(&self) -> StoreCapacitySnapshot {
+        let dram = self.dram.lock().capacity_snapshot();
+        StoreCapacitySnapshot {
+            dram_bytes_used: dram.dram_bytes_used,
+            dram_bytes_capacity: dram.dram_bytes_capacity,
+            ssd_bytes_used: self.ssd_bytes_used(),
+            ssd_bytes_capacity: self.ssd_bytes_capacity,
+        }
+    }
+
+    fn allocate_and_write(&self, len: usize, data: &[u8]) -> Result<ChunkHandle, StoreError> {
+        let mut dram = self.dram.lock();
+        let handle = dram.allocate(len)?;
+        dram.write_chunk(&handle, data)?;
+        Ok(handle)
+    }
+
+    async fn write_preallocated(
+        &self,
+        handle: &ChunkHandle,
+        bytes: &[u8],
+        tenant_id: Option<&str>,
+        cache_key: Option<&str>,
+    ) -> Result<(), StoreNodeError> {
+        {
+            let mut dram = self.dram.lock();
+            dram.write_preallocated_chunk(handle, bytes)?;
+        }
+
+        if let (Some(ssd), Some(tenant_id), Some(cache_key)) = (&self.ssd, tenant_id, cache_key) {
+            ssd.persist_object(tenant_id, cache_key, bytes).await?;
+            self.record_ssd_object(tenant_id, cache_key, bytes.len());
+        }
+        Ok(())
+    }
+
+    async fn read_chunk(
+        &self,
+        handle: &ChunkHandle,
+        tenant_id: Option<&str>,
+        cache_key: Option<&str>,
+    ) -> Result<ReadChunkResponse, StoreNodeError> {
+        let dram_result = {
+            let dram = self.dram.lock();
+            dram.read_chunk(handle)
+        };
+        match dram_result {
+            Ok(data) => Ok(ReadChunkResponse {
+                offset: handle.offset(),
+                len: handle.len(),
+                tier: "dram",
+                data,
+            }),
+            Err(err @ (StoreError::InvalidHandle { .. } | StoreError::UnwrittenChunk))
+                if self.can_promote_from_ssd(tenant_id, cache_key) =>
+            {
+                let (Some(ssd), Some(tenant_id), Some(cache_key)) =
+                    (&self.ssd, tenant_id, cache_key)
+                else {
+                    return Err(err.into());
+                };
+                let data = ssd.promote_to_dram(tenant_id, cache_key).await?;
+                {
+                    let mut dram = self.dram.lock();
+                    dram.write_preallocated_chunk(handle, &data)?;
+                }
+                Ok(ReadChunkResponse {
+                    offset: handle.offset(),
+                    len: handle.len(),
+                    tier: "ssd",
+                    data,
+                })
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn can_promote_from_ssd(&self, tenant_id: Option<&str>, cache_key: Option<&str>) -> bool {
+        self.ssd.is_some() && tenant_id.is_some() && cache_key.is_some()
+    }
+
+    fn record_ssd_object(&self, tenant_id: &str, cache_key: &str, len: usize) {
+        self.ssd_objects
+            .lock()
+            .insert((tenant_id.to_owned(), cache_key.to_owned()), len);
+    }
+
+    fn ssd_bytes_used(&self) -> u64 {
+        self.ssd_objects
+            .lock()
+            .values()
+            .fold(0_u64, |total, len| total.saturating_add(usize_to_u64(*len)))
+    }
+}
+
+enum StoreNodeError {
+    Store(StoreError),
+    Ssd(SsdError),
+}
+
+impl From<StoreError> for StoreNodeError {
+    fn from(value: StoreError) -> Self {
+        Self::Store(value)
+    }
+}
+
+impl From<SsdError> for StoreNodeError {
+    fn from(value: SsdError) -> Self {
+        Self::Ssd(value)
+    }
+}
 fn usage() -> String {
     format!(
         "{SERVICE_NAME}\n\nUsage: cargo run -p mooncache-store-node-app -- [OPTIONS]\n\nOptions:\n  --bind-addr <ADDR>           API bind address [env: {SERVICE_ENV_PREFIX}_BIND_ADDR or MOONCACHE_BIND_ADDR] [default: {DEFAULT_BIND_ADDR}]\n  --etcd-url <URL>             Etcd endpoint URL [env: {SERVICE_ENV_PREFIX}_ETCD_URL or MOONCACHE_ETCD_URL] [default: {DEFAULT_ETCD_URL}]\n  --tenant-config <PATH>       Tenant config path [env: {SERVICE_ENV_PREFIX}_TENANT_CONFIG or MOONCACHE_TENANT_CONFIG] [default: {DEFAULT_TENANT_CONFIG_PATH}]\n  --ssd-root <PATH>            SSD root path [env: {SERVICE_ENV_PREFIX}_SSD_ROOT or MOONCACHE_SSD_ROOT] [default: {DEFAULT_SSD_ROOT_PATH}]\n  --metrics-bind-addr <ADDR>   Metrics bind address [env: {SERVICE_ENV_PREFIX}_METRICS_BIND_ADDR or MOONCACHE_METRICS_BIND_ADDR] [default: {DEFAULT_METRICS_BIND_ADDR}]\n  --vendor-config <PATH>       Vendor config path [env: {SERVICE_ENV_PREFIX}_VENDOR_CONFIG or MOONCACHE_VENDOR_CONFIG] [default: {DEFAULT_VENDOR_CONFIG_PATH}]\n  -h, --help                   Print help and exit\n"
@@ -194,13 +349,58 @@ async fn run_server(config: AppConfig) -> Result<(), String> {
         .local_addr()
         .map_err(|error| format!("failed to read bound address: {error}"))?;
     println!("{SERVICE_NAME} listening on {local_addr}");
-    axum::serve(listener, build_router())
-        .await
-        .map_err(|error| format!("server error: {error}"))
+    axum::serve(
+        listener,
+        build_router_with_ssd_root(&config.ssd_root_path).await?,
+    )
+    .await
+    .map_err(|error| format!("server error: {error}"))
 }
 
+#[cfg(test)]
 fn build_router() -> Router {
-    build_router_with_state(Arc::new(Mutex::new(MemoryStore::with_capacity(1_048_576))))
+    build_router_with_state(Arc::new(StoreNodeState::memory_only(1_048_576)))
+}
+
+async fn build_router_with_ssd_root(ssd_root: impl AsRef<Path>) -> Result<Router, String> {
+    let ssd_key = ssd_key_from_env()?;
+    let state = StoreNodeState::with_ssd(1_048_576, ssd_root, 1_048_576, &ssd_key)
+        .await
+        .map_err(|error| format!("failed to initialize SSD tier: {error}"))?;
+    Ok(build_router_with_state(Arc::new(state)))
+}
+
+fn ssd_key_from_env() -> Result<[u8; 32], String> {
+    let value = env::var(format!("{SERVICE_ENV_PREFIX}_SSD_KEY"))
+        .or_else(|_| env::var("MOONCACHE_SSD_KEY"))
+        .map_err(|_| {
+            format!(
+                "{SERVICE_ENV_PREFIX}_SSD_KEY or MOONCACHE_SSD_KEY must be set to 64 lowercase hex characters"
+            )
+        })?;
+    parse_32_byte_hex(&value)
+}
+
+fn parse_32_byte_hex(value: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err("SSD key must be 64 lowercase hex characters".to_string());
+    }
+    let mut out = [0_u8; 32];
+    let bytes = value.as_bytes();
+    for (index, slot) in out.iter_mut().enumerate() {
+        let high = hex_nibble(bytes[index * 2])?;
+        let low = hex_nibble(bytes[index * 2 + 1])?;
+        *slot = (high << 4) | low;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err("SSD key must be 64 lowercase hex characters".to_string()),
+    }
 }
 
 fn build_router_with_state(state: AppState) -> Router {
@@ -223,7 +423,7 @@ async fn healthz() -> Json<Value> {
 }
 
 async fn metrics_snapshot(State(state): State<AppState>) -> Json<Value> {
-    let snapshot = state.lock().capacity_snapshot();
+    let snapshot = state.capacity_snapshot();
     Json(json!(snapshot))
 }
 
@@ -231,10 +431,8 @@ async fn post_chunk(
     State(state): State<AppState>,
     Json(req): Json<WriteChunkRequest>,
 ) -> Result<Json<WriteChunkResponse>, (StatusCode, Json<Value>)> {
-    let mut store = state.lock();
-    let handle = store.allocate(req.len).map_err(store_error_to_response)?;
-    store
-        .write_chunk(&handle, &req.data)
+    let handle = state
+        .allocate_and_write(req.len, &req.data)
         .map_err(store_error_to_response)?;
     Ok(Json(WriteChunkResponse {
         ok: true,
@@ -248,10 +446,15 @@ async fn post_chunk_preallocated(
     Json(req): Json<PreallocatedWriteRequest>,
 ) -> Result<Json<WriteChunkResponse>, (StatusCode, Json<Value>)> {
     let handle = ChunkHandle::new(req.offset, req.len);
-    let mut store = state.lock();
-    store
-        .write_preallocated_chunk(&handle, &req.data)
-        .map_err(store_error_to_response)?;
+    state
+        .write_preallocated(
+            &handle,
+            &req.data,
+            req.tenant_id.as_deref(),
+            req.cache_key.as_deref(),
+        )
+        .await
+        .map_err(store_node_error_to_response)?;
     Ok(Json(WriteChunkResponse {
         ok: true,
         offset: handle.offset(),
@@ -261,14 +464,19 @@ async fn post_chunk_preallocated(
 
 async fn get_chunk(
     State(state): State<AppState>,
-    Path((offset, len)): Path<(usize, usize)>,
+    AxumPath((offset, len)): AxumPath<(usize, usize)>,
+    Query(query): Query<ReadChunkQuery>,
 ) -> Result<Json<ReadChunkResponse>, (StatusCode, Json<Value>)> {
     let handle = ChunkHandle::new(offset, len);
-    let store = state.lock();
-    let data = store.read_chunk(&handle).map_err(store_error_to_response)?;
-    // Drop the lock before building the response
-    drop(store);
-    Ok(Json(ReadChunkResponse { offset, len, data }))
+    state
+        .read_chunk(
+            &handle,
+            query.tenant_id.as_deref(),
+            query.cache_key.as_deref(),
+        )
+        .await
+        .map(Json)
+        .map_err(store_node_error_to_response)
 }
 
 // ── Error mapping ────────────────────────────────────────────────
@@ -283,6 +491,29 @@ fn store_error_to_response(error: StoreError) -> (StatusCode, Json<Value>) {
     (code, Json(json!({"error": error.to_string()})))
 }
 
+fn store_node_error_to_response(error: StoreNodeError) -> (StatusCode, Json<Value>) {
+    match error {
+        StoreNodeError::Store(error) => store_error_to_response(error),
+        StoreNodeError::Ssd(error) => ssd_error_to_response(error),
+    }
+}
+
+fn ssd_error_to_response(error: SsdError) -> (StatusCode, Json<Value>) {
+    let code = match &error {
+        SsdError::InvalidPathSegment { .. } => StatusCode::BAD_REQUEST,
+        SsdError::NotFound { .. } => StatusCode::NOT_FOUND,
+        SsdError::CorruptObject { .. }
+        | SsdError::Encryption
+        | SsdError::Decryption
+        | SsdError::Io { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (code, Json(json!({"error": error.to_string()})))
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 // ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -295,6 +526,27 @@ mod tests {
     };
     use serde_json::{json, Value};
     use tower::ServiceExt;
+
+    const TEST_SSD_KEY: &[u8; 32] = b"mooncache-store-node-test-key!!!";
+
+    #[test]
+    fn parses_32_byte_ssd_key_hex() {
+        let key =
+            parse_32_byte_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .expect("valid hex key should parse");
+
+        assert_eq!(key[0], 0);
+        assert_eq!(key[31], 31);
+    }
+
+    #[test]
+    fn rejects_missing_or_uppercase_ssd_key_hex() {
+        assert!(parse_32_byte_hex("abc").is_err());
+        assert!(parse_32_byte_hex(
+            "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F"
+        )
+        .is_err());
+    }
 
     // ── CLI tests (preserved from original) ──────────────────────
 
@@ -558,7 +810,132 @@ mod tests {
         assert_eq!(body["dram_bytes_capacity"], json!(1_048_576));
     }
 
+    #[tokio::test]
+    async fn preallocated_write_with_object_identity_updates_ssd_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_router_with_ssd_for_test(dir.path(), 1_048_576).await;
+        let payload = b"ssd mirror";
+
+        let write_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chunks/preallocated")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "tenant_id": "tenant-a",
+                            "cache_key": "abcdef",
+                            "offset": 0,
+                            "len": payload.len(),
+                            "data": payload.to_vec()
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("write should complete");
+
+        assert_eq!(write_resp.status(), StatusCode::OK);
+
+        let metrics_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics/snapshot")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("snapshot should complete");
+        let metrics = response_json(metrics_resp).await;
+        assert_eq!(metrics["dram_bytes_used"], json!(payload.len()));
+        assert_eq!(metrics["ssd_bytes_used"], json!(payload.len()));
+        assert_eq!(metrics["ssd_bytes_capacity"], json!(1_048_576));
+    }
+
+    #[tokio::test]
+    async fn read_promotes_from_ssd_when_dram_chunk_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = build_router_with_ssd_for_test(dir.path(), 1_048_576).await;
+        let payload = b"promote from ssd";
+
+        let _write = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chunks/preallocated")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "tenant_id": "tenant-a",
+                            "cache_key": "abcdef",
+                            "offset": 64,
+                            "len": payload.len(),
+                            "data": payload.to_vec()
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("write should complete");
+
+        let cold_app = build_router_with_existing_ssd_for_test(dir.path(), 1_048_576).await;
+        let read_resp = cold_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/chunks/64/{}?tenant_id=tenant-a&cache_key=abcdef",
+                        payload.len()
+                    ))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("read should complete");
+
+        assert_eq!(read_resp.status(), StatusCode::OK);
+        let body = response_json(read_resp).await;
+        assert_eq!(body["tier"], json!("ssd"));
+        let returned: Vec<u8> =
+            serde_json::from_value(body["data"].clone()).expect("data should be bytes");
+        assert_eq!(returned, payload.to_vec());
+
+        let promoted_resp = cold_app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/chunks/64/{}", payload.len()))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("promoted read should complete");
+        let promoted = response_json(promoted_resp).await;
+        assert_eq!(promoted["tier"], json!("dram"));
+    }
+
     // ── Helpers ──────────────────────────────────────────────────
+
+    async fn build_router_with_ssd_for_test(root: &Path, ssd_bytes_capacity: u64) -> Router {
+        let state = StoreNodeState::with_ssd(1_048_576, root, ssd_bytes_capacity, TEST_SSD_KEY)
+            .await
+            .expect("SSD state should build");
+        build_router_with_state(Arc::new(state))
+    }
+
+    async fn build_router_with_existing_ssd_for_test(
+        root: &Path,
+        ssd_bytes_capacity: u64,
+    ) -> Router {
+        let state = StoreNodeState::with_ssd(1_048_576, root, ssd_bytes_capacity, TEST_SSD_KEY)
+            .await
+            .expect("SSD state should build");
+        build_router_with_state(Arc::new(state))
+    }
 
     async fn response_json(response: axum::response::Response) -> Value {
         let bytes = to_bytes(response.into_body(), usize::MAX)

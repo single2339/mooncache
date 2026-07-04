@@ -183,17 +183,26 @@ impl GatewayState {
         self.master_client.put_revoke(tenant_id, cache_key).await
     }
 
-    async fn store_read_chunk(&self, handle: &ChunkHandle) -> Result<Vec<u8>, GatewayError> {
-        self.store_client.read_chunk(handle).await
+    async fn store_read_chunk(
+        &self,
+        tenant_id: &TenantId,
+        cache_key: &CacheKey,
+        handle: &ChunkHandle,
+    ) -> Result<crate::clients::StoreChunk, GatewayError> {
+        self.store_client
+            .read_chunk(tenant_id, cache_key, handle)
+            .await
     }
 
     async fn store_write_preallocated_chunk(
         &self,
+        tenant_id: &TenantId,
+        cache_key: &CacheKey,
         handle: &ChunkHandle,
         bytes: &[u8],
     ) -> Result<(), GatewayError> {
         self.store_client
-            .write_preallocated_chunk(handle, bytes)
+            .write_preallocated_chunk(tenant_id, cache_key, handle, bytes)
             .await
     }
 
@@ -371,10 +380,10 @@ pub async fn handle_response_request(
         if let Some(cached_body) = read_cached_body(state, &tenant_id, &cache_key).await? {
             record_simple(CacheStatus::Hit, CacheWriteStatus::Skipped);
             return Ok(GatewayResponse::ok(
-                cached_body,
+                cached_body.value,
                 CacheStatus::Hit,
                 CacheWriteStatus::Skipped.as_header_value(),
-                "dram",
+                &cached_body.tier,
                 Some(&cache_key),
             ));
         }
@@ -506,11 +515,11 @@ async fn streaming_response(
             record_gateway_metrics(state, CacheStatus::Hit, CacheWriteStatus::Skipped);
             state.metrics.record_singleflight(SingleflightRole::None);
             return Ok(GatewayResponse::ok_stream(
-                cached_stream.final_body,
-                cached_stream.events,
+                cached_stream.value.final_body,
+                cached_stream.value.events,
                 CacheStatus::Hit,
                 CacheWriteStatus::Skipped.as_header_value(),
-                "dram",
+                &cached_stream.tier,
                 Some(&cache_key),
             ));
         }
@@ -595,33 +604,47 @@ async fn vendor_response(
     ))
 }
 
+struct CachedPayload<T> {
+    value: T,
+    tier: String,
+}
+
 async fn read_cached_body(
     state: &GatewayState,
     tenant_id: &TenantId,
     cache_key: &CacheKey,
-) -> Result<Option<Value>, GatewayError> {
-    let Some(bytes) = read_cached_bytes(state, tenant_id, cache_key).await? else {
+) -> Result<Option<CachedPayload<Value>>, GatewayError> {
+    let Some(chunk) = read_cached_bytes(state, tenant_id, cache_key).await? else {
         return Ok(None);
     };
-    Ok(Some(streaming::cached_body_from_bytes(&bytes)?))
+    Ok(Some(CachedPayload {
+        value: streaming::cached_body_from_bytes(&chunk.bytes)?,
+        tier: chunk.tier,
+    }))
 }
 
 async fn read_cached_stream_object(
     state: &GatewayState,
     tenant_id: &TenantId,
     cache_key: &CacheKey,
-) -> Result<Option<CachedStreamObject>, GatewayError> {
-    let Some(bytes) = read_cached_bytes(state, tenant_id, cache_key).await? else {
+) -> Result<Option<CachedPayload<CachedStreamObject>>, GatewayError> {
+    let Some(chunk) = read_cached_bytes(state, tenant_id, cache_key).await? else {
         return Ok(None);
     };
-    streaming::stream_object_from_bytes(&bytes).map_err(GatewayError::from)
+    let Some(value) = streaming::stream_object_from_bytes(&chunk.bytes)? else {
+        return Ok(None);
+    };
+    Ok(Some(CachedPayload {
+        value,
+        tier: chunk.tier,
+    }))
 }
 
 async fn read_cached_bytes(
     state: &GatewayState,
     tenant_id: &TenantId,
     cache_key: &CacheKey,
-) -> Result<Option<Vec<u8>>, GatewayError> {
+) -> Result<Option<crate::clients::StoreChunk>, GatewayError> {
     let replica = match state.master_get_replica_list(tenant_id, cache_key).await {
         Ok(replica_list) => replica_list.replicas.into_iter().next(),
         Err(GatewayError::Cache(CacheError::NotFound)) => return Ok(None),
@@ -632,7 +655,10 @@ async fn read_cached_bytes(
         return Ok(None);
     };
     let handle = ChunkHandle::from_replica(&replica)?;
-    state.store_read_chunk(&handle).await.map(Some)
+    state
+        .store_read_chunk(tenant_id, cache_key, &handle)
+        .await
+        .map(Some)
 }
 
 async fn write_cached_body(
@@ -669,7 +695,7 @@ async fn write_cached_bytes(
         .master_put_start(tenant_id, cache_key, len, REPLICA_COUNT)
         .await?;
 
-    if let Err(err) = write_reserved_replicas(state, &replicas, bytes).await {
+    if let Err(err) = write_reserved_replicas(state, tenant_id, cache_key, &replicas, bytes).await {
         return Err(revoke_reservation_after_write_failure(state, tenant_id, cache_key, err).await);
     }
 
@@ -681,12 +707,16 @@ async fn write_cached_bytes(
 
 async fn write_reserved_replicas(
     state: &GatewayState,
+    tenant_id: &TenantId,
+    cache_key: &CacheKey,
     replicas: &[ReplicaDescriptor],
     bytes: &[u8],
 ) -> Result<(), GatewayError> {
     for replica in replicas {
         let handle = ChunkHandle::from_replica(replica)?;
-        state.store_write_preallocated_chunk(&handle, bytes).await?;
+        state
+            .store_write_preallocated_chunk(tenant_id, cache_key, &handle, bytes)
+            .await?;
     }
     Ok(())
 }

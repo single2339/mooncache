@@ -47,15 +47,17 @@ pub struct SsdStore {
 
 impl SsdStore {
     pub async fn new_for_test(root: impl AsRef<Path>) -> SsdResult<Self> {
+        let key = ChaCha20Poly1305::generate_key(&mut OsRng);
+        Self::new_with_key(root, key.as_slice()).await
+    }
+
+    pub async fn new_with_key(root: impl AsRef<Path>, key: &[u8]) -> SsdResult<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)
             .await
             .map_err(|source| io_error("creating SSD root", &root, source))?;
-        let key = ChaCha20Poly1305::generate_key(&mut OsRng);
-        Ok(Self {
-            root,
-            cipher: ChaCha20Poly1305::new(&key),
-        })
+        let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|_| SsdError::Encryption)?;
+        Ok(Self { root, cipher })
     }
 
     pub async fn persist_object(

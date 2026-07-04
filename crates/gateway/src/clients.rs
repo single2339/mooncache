@@ -40,12 +40,25 @@ pub trait MasterClient: Send + Sync {
 
 // ── StoreClient ───────────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreChunk {
+    pub bytes: Vec<u8>,
+    pub tier: String,
+}
+
 #[async_trait]
 pub trait StoreClient: Send + Sync {
-    async fn read_chunk(&self, handle: &ChunkHandle) -> Result<Vec<u8>, GatewayError>;
+    async fn read_chunk(
+        &self,
+        tenant_id: &TenantId,
+        cache_key: &CacheKey,
+        handle: &ChunkHandle,
+    ) -> Result<StoreChunk, GatewayError>;
 
     async fn write_preallocated_chunk(
         &self,
+        tenant_id: &TenantId,
+        cache_key: &CacheKey,
         handle: &ChunkHandle,
         bytes: &[u8],
     ) -> Result<(), GatewayError>;
@@ -134,16 +147,27 @@ impl LocalStoreClient {
 
 #[async_trait]
 impl StoreClient for LocalStoreClient {
-    async fn read_chunk(&self, handle: &ChunkHandle) -> Result<Vec<u8>, GatewayError> {
-        self.inner
+    async fn read_chunk(
+        &self,
+        _tenant_id: &TenantId,
+        _cache_key: &CacheKey,
+        handle: &ChunkHandle,
+    ) -> Result<StoreChunk, GatewayError> {
+        let bytes = self
+            .inner
             .lock()
             .map_err(|_| GatewayError::PoisonedLock)?
-            .read_chunk(handle)
-            .map_err(Into::into)
+            .read_chunk(handle)?;
+        Ok(StoreChunk {
+            bytes,
+            tier: "dram".to_string(),
+        })
     }
 
     async fn write_preallocated_chunk(
         &self,
+        _tenant_id: &TenantId,
+        _cache_key: &CacheKey,
         handle: &ChunkHandle,
         bytes: &[u8],
     ) -> Result<(), GatewayError> {
@@ -328,6 +352,7 @@ impl RemoteMasterClient {
 struct StoreReadResponse {
     offset: usize,
     len: usize,
+    tier: Option<String>,
     data: Vec<u8>,
 }
 
@@ -363,15 +388,26 @@ impl RemoteStoreClient {
 
 #[async_trait]
 impl StoreClient for RemoteStoreClient {
-    async fn read_chunk(&self, handle: &ChunkHandle) -> Result<Vec<u8>, GatewayError> {
+    async fn read_chunk(
+        &self,
+        tenant_id: &TenantId,
+        cache_key: &CacheKey,
+        handle: &ChunkHandle,
+    ) -> Result<StoreChunk, GatewayError> {
         // For read, any node can serve — use the first configured node.
-        // In practice the replica descriptor provides the node_id, but the caller
-        // supplies a full ChunkHandle (offset/len); we use the first available URL.
+        // Sprint 3 passes object identity so Store can promote from SSD on a DRAM miss.
         let base_url =
             self.node_urls.values().next().ok_or_else(|| {
                 GatewayError::StoreUpstream("no store nodes configured".to_string())
             })?;
-        let url = format!("{}/chunks/{}/{}", base_url, handle.offset(), handle.len());
+        let url = format!(
+            "{}/chunks/{}/{}?tenant_id={}&cache_key={}",
+            base_url,
+            handle.offset(),
+            handle.len(),
+            tenant_id.as_str(),
+            cache_key.as_str()
+        );
         let response = self
             .client
             .get(&url)
@@ -384,7 +420,10 @@ impl StoreClient for RemoteStoreClient {
                 .json()
                 .await
                 .map_err(|e| GatewayError::StoreUpstream(e.to_string()))?;
-            Ok(body.data)
+            Ok(StoreChunk {
+                bytes: body.data,
+                tier: body.tier.unwrap_or_else(|| "dram".to_string()),
+            })
         } else {
             let err_body: StoreErrorResponse =
                 response.json().await.unwrap_or(StoreErrorResponse {
@@ -396,21 +435,22 @@ impl StoreClient for RemoteStoreClient {
 
     async fn write_preallocated_chunk(
         &self,
+        tenant_id: &TenantId,
+        cache_key: &CacheKey,
         handle: &ChunkHandle,
         bytes: &[u8],
     ) -> Result<(), GatewayError> {
         // For write_preallocated_chunk called from write_reserved_replicas,
         // the caller iterates over replicas and calls us once per replica.
-        // We need to know which node to write to. Since the ChunkHandle doesn't
-        // carry node_id, this method is used in the single-node case where
-        // all replicas are on the same node. For multi-node, the caller would
-        // use a node-specific write method.
+        // This Sprint 2/3 client remains single-node; object identity lets Store mirror to SSD.
         let base_url =
             self.node_urls.values().next().ok_or_else(|| {
                 GatewayError::StoreUpstream("no store nodes configured".to_string())
             })?;
         let url = format!("{}/chunks/preallocated", base_url);
         let body = serde_json::json!({
+            "tenant_id": tenant_id.as_str(),
+            "cache_key": cache_key.as_str(),
             "offset": handle.offset(),
             "len": handle.len(),
             "data": bytes,

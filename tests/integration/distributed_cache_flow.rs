@@ -335,15 +335,24 @@ async fn start_store_server() -> (String, tokio::task::JoinHandle<()>) {
             "/chunks/{offset}/{len}",
             axum::routing::get({
                 let store = Arc::clone(&store);
-                move |axum::extract::Path((offset, len)): axum::extract::Path<(usize, usize)>| {
+                move |axum::extract::Path((offset, len)): axum::extract::Path<(usize, usize)>,
+                      axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>| {
                     let store = Arc::clone(&store);
                     async move {
+                        if params.get("tenant_id").map(String::as_str) != Some("test-tenant")
+                            || params.get("cache_key").map(String::len) != Some(64)
+                        {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                axum::Json(json!({"error": "missing object identity"})),
+                            );
+                        }
                         let handle = ChunkHandle::new(offset, len);
                         let store = store.lock();
                         match store.read_chunk(&handle) {
                             Ok(data) => (
                                 axum::http::StatusCode::OK,
-                                axum::Json(json!({"offset": offset, "len": len, "data": data})),
+                                axum::Json(json!({"offset": offset, "len": len, "tier": "dram", "data": data})),
                             ),
                             Err(err) => (
                                 axum::http::StatusCode::NOT_FOUND,
@@ -361,6 +370,14 @@ async fn start_store_server() -> (String, tokio::task::JoinHandle<()>) {
                 move |axum::Json(body): axum::Json<Value>| {
                     let store = Arc::clone(&store);
                     async move {
+                        if body["tenant_id"].as_str() != Some("test-tenant")
+                            || body["cache_key"].as_str().map(str::len) != Some(64)
+                        {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                axum::Json(json!({"error": "missing object identity"})),
+                            );
+                        }
                         let offset = body["offset"].as_u64().unwrap_or(0) as usize;
                         let len = body["len"].as_u64().unwrap_or(0) as usize;
                         let data: Vec<u8> =
