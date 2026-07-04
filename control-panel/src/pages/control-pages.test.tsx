@@ -5,6 +5,7 @@ import { Overview } from './Overview'
 import { CacheAnalytics } from './CacheAnalytics'
 import { Nodes } from './Nodes'
 import { AuditLog } from './AuditLog'
+import { Alerts } from './Alerts'
 import { CacheOperations } from './CacheOperations'
 import { Tenants } from './Tenants'
 import { Vendors } from './Vendors'
@@ -283,6 +284,52 @@ describe('control panel data pages', () => {
     expect(screen.getByRole('cell', { name: 'DrainNode' })).toBeInTheDocument()
     expect(screen.getByText('Success')).toBeInTheDocument()
     expect(screen.getByText('req-123')).toBeInTheDocument()
+  })
+
+  it('paginates audit events without dropping event order', async () => {
+    const user = userEvent.setup()
+    const manyEvents = Array.from({ length: 11 }, (_, index) => ({
+      ...auditEvents[0],
+      request_id: `req-${index + 1}`,
+      timestamp_ms: auditEvents[0].timestamp_ms + index,
+    }))
+
+    render(<AuditLog events={manyEvents} />)
+
+    expect(screen.getByText(/page 1 of 2/i)).toBeInTheDocument()
+    expect(screen.getByRole('cell', { name: 'req-1' })).toBeInTheDocument()
+    expect(screen.queryByRole('cell', { name: 'req-11' })).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: /next audit events/i }))
+
+    expect(screen.getByText(/page 2 of 2/i)).toBeInTheDocument()
+    expect(screen.getByRole('cell', { name: 'req-11' })).toBeInTheDocument()
+    expect(screen.queryByRole('cell', { name: 'req-1' })).not.toBeInTheDocument()
+  })
+
+  it('paginates alert history separately from active alerts', async () => {
+    const user = userEvent.setup()
+    const manyResolvedAlerts = Array.from({ length: 11 }, (_, index) => ({
+      id: `resolved-${index + 1}`,
+      severity: 'info' as const,
+      status: 'resolved' as const,
+      message: `Resolved alert ${index + 1}`,
+      resource: 'cache',
+      startedAtMs: Date.UTC(2026, 0, 1) + index,
+      lastSeenAtMs: Date.UTC(2026, 0, 1) + index,
+    }))
+
+    render(<Alerts alerts={[...manyResolvedAlerts]} />)
+
+    expect(screen.getByText(/page 1 of 2/i)).toBeInTheDocument()
+    expect(screen.getByText('Resolved alert 1')).toBeInTheDocument()
+    expect(screen.queryByText('Resolved alert 11')).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: /next alert history/i }))
+
+    expect(screen.getByText(/page 2 of 2/i)).toBeInTheDocument()
+    expect(screen.getByText('Resolved alert 11')).toBeInTheDocument()
+    expect(screen.queryByText('Resolved alert 1')).not.toBeInTheDocument()
   })
 
   it('answers overview operator questions from provided data', () => {

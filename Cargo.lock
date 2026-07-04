@@ -685,6 +685,7 @@ dependencies = [
  "axum",
  "mooncache-admin-api",
  "mooncache-common",
+ "mooncache-gateway",
  "mooncache-master",
  "serde",
  "serde_json",

@@ -1,3 +1,5 @@
+import { useEffect, useState } from 'react'
+
 import type { AuditEvent, AuditResult } from '../api/types'
 
 interface AuditLogProps {
@@ -9,8 +11,20 @@ const dateFormatter = new Intl.DateTimeFormat('en-US', {
   timeStyle: 'short',
   timeZone: 'UTC',
 })
+const pageSize = 10
+
 
 export function AuditLog({ events }: AuditLogProps) {
+  const [page, setPage] = useState(0)
+  useEffect(() => setPage(0), [events])
+
+  const pageCount = Math.max(1, Math.ceil(events.length / pageSize))
+  const safePage = Math.min(page, pageCount - 1)
+  const visibleEvents = events.slice(safePage * pageSize, safePage * pageSize + pageSize)
+
+  const goToPreviousPage = () => setPage((currentPage) => Math.max(0, currentPage - 1))
+  const goToNextPage = () => setPage((currentPage) => Math.min(pageCount - 1, currentPage + 1))
+
   return (
     <section className="page-stack" aria-labelledby="audit-log-heading">
       <div>
@@ -38,7 +52,7 @@ export function AuditLog({ events }: AuditLogProps) {
             </tr>
           </thead>
           <tbody>
-            {events.map((event) => (
+            {visibleEvents.map((event) => (
               <tr key={event.request_id}>
                 <td>{dateFormatter.format(new Date(event.timestamp_ms))}</td>
                 <td>{event.actor}</td>
@@ -52,6 +66,19 @@ export function AuditLog({ events }: AuditLogProps) {
             ))}
           </tbody>
         </table>
+        {pageCount > 1 ? (
+          <nav className="pagination" aria-label="Audit events pagination">
+            <button type="button" onClick={goToPreviousPage} disabled={safePage === 0}>
+              Previous audit events
+            </button>
+            <span>
+              Page {safePage + 1} of {pageCount}
+            </span>
+            <button type="button" onClick={goToNextPage} disabled={safePage === pageCount - 1}>
+              Next audit events
+            </button>
+          </nav>
+        ) : null}
       </section>
     </section>
   )

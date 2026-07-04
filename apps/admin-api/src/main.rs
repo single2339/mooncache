@@ -15,8 +15,9 @@ use mooncache_admin_api::{
     AdminAction, AdminError, AdminRequestContext, AdminService, CacheFingerprintDebugRequest, Role,
 };
 use mooncache_common::{CacheError, CacheKey, RequestId, TenantId};
+use mooncache_gateway::{TenantCachePolicy, TenantConfigSet, VendorConfigSet};
 use mooncache_master::MasterState;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
@@ -163,6 +164,36 @@ fn print_resolved_config(config: &AppConfig) {
 struct AdminHttpState {
     service: Arc<AdminService>,
     master: Arc<Mutex<MasterState>>,
+    tenants: Arc<Vec<TenantHttpView>>,
+    vendors: Arc<Vec<VendorHttpView>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TenantHttpView {
+    tenant_id: String,
+    api_key_ref: String,
+    dram_quota_bytes: u64,
+    ssd_quota_bytes: u64,
+    request_rate_limit_per_minute: u32,
+    stream_concurrency_limit: u32,
+    vendor_spend_budget_usd: u32,
+    default_ttl_seconds: u64,
+    policy: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VendorHttpView {
+    vendor_id: String,
+    health: &'static str,
+    models: Vec<String>,
+    resolved_version: String,
+    rate_limit_remaining: u32,
+    error_rate: f64,
+    retry_count: u32,
+    cost_per_million_tokens_usd: f64,
+    routing_policy: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,30 +222,123 @@ async fn run_server(config: AppConfig) -> Result<(), String> {
         .local_addr()
         .map_err(|error| format!("failed to read bound address: {error}"))?;
     println!("{SERVICE_NAME} listening on {local_addr}");
-    axum::serve(listener, build_router())
-        .await
-        .map_err(|error| format!("server error: {error}"))
+    axum::serve(
+        listener,
+        build_router(build_admin_state_from_config(&config)?),
+    )
+    .await
+    .map_err(|error| format!("server error: {error}"))
 }
 
-fn build_router() -> Router {
+fn build_router(state: AdminHttpState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/admin/metrics", get(admin_metrics))
         .route("/admin/audit-events", get(audit_events))
         .route("/admin/nodes", get(nodes))
+        .route("/admin/tenants", get(tenants))
+        .route("/admin/vendors", get(vendors))
+        .route("/admin/alerts", get(alerts))
         .route("/admin/nodes/{node_id}/drain", post(drain_node))
         .route("/admin/cache/fingerprint/debug", post(fingerprint_debug))
         .route("/admin/cache/purge", post(cache_purge))
         .route("/admin/cache/warmup", post(cache_warmup))
-        .with_state(build_admin_state())
+        .with_state(state)
 }
 
-fn build_admin_state() -> AdminHttpState {
+fn build_admin_state_from_config(config: &AppConfig) -> Result<AdminHttpState, String> {
+    let tenants = TenantConfigSet::load(&config.tenant_config_path)
+        .map_err(|error| format!("failed to load tenant config: {error}"))?;
+    let vendors = VendorConfigSet::load(&config.vendor_config_path)
+        .map_err(|error| format!("failed to load vendor config: {error}"))?;
+    Ok(build_admin_state(
+        tenant_views(&tenants),
+        vendor_views(&vendors),
+    ))
+}
+
+fn build_admin_state(tenants: Vec<TenantHttpView>, vendors: Vec<VendorHttpView>) -> AdminHttpState {
     let mut master = MasterState::new_for_test();
     master.mount_segment("local-store", 1_048_576);
     AdminHttpState {
         service: Arc::new(AdminService::new_for_test(["local-store"])),
         master: Arc::new(Mutex::new(master)),
+        tenants: Arc::new(tenants),
+        vendors: Arc::new(vendors),
+    }
+}
+
+#[cfg(test)]
+fn build_admin_state_for_test() -> AdminHttpState {
+    build_admin_state(
+        vec![TenantHttpView {
+            tenant_id: "test-tenant".to_owned(),
+            api_key_ref: "sha256:e46ea83e…".to_owned(),
+            dram_quota_bytes: 1_073_741_824,
+            ssd_quota_bytes: 10_737_418_240,
+            request_rate_limit_per_minute: 12_000,
+            stream_concurrency_limit: 80,
+            vendor_spend_budget_usd: 5_000,
+            default_ttl_seconds: 86_400,
+            policy: "cache_first",
+        }],
+        vec![VendorHttpView {
+            vendor_id: "mock".to_owned(),
+            health: "healthy",
+            models: vec!["gpt-test".to_owned()],
+            resolved_version: "mock-v1".to_owned(),
+            rate_limit_remaining: 0,
+            error_rate: 0.0,
+            retry_count: 0,
+            cost_per_million_tokens_usd: 0.0,
+            routing_policy: "mock".to_owned(),
+        }],
+    )
+}
+
+fn tenant_views(configs: &TenantConfigSet) -> Vec<TenantHttpView> {
+    configs
+        .tenants()
+        .map(|tenant| TenantHttpView {
+            tenant_id: tenant.id.as_str().to_owned(),
+            api_key_ref: format!("sha256:{}…", &tenant.api_key_sha256[..8]),
+            dram_quota_bytes: tenant.dram_quota_bytes,
+            ssd_quota_bytes: tenant.ssd_quota_bytes,
+            request_rate_limit_per_minute: tenant.request_rate_limit_per_minute,
+            stream_concurrency_limit: tenant.stream_concurrency_limit,
+            vendor_spend_budget_usd: tenant.vendor_spend_budget_usd,
+            default_ttl_seconds: tenant.default_ttl_seconds,
+            policy: tenant_policy_label(tenant.policy),
+        })
+        .collect()
+}
+
+fn vendor_views(configs: &VendorConfigSet) -> Vec<VendorHttpView> {
+    configs
+        .vendors()
+        .map(|vendor| VendorHttpView {
+            vendor_id: vendor.id.clone(),
+            health: "healthy",
+            models: vendor
+                .models
+                .iter()
+                .map(|model| model.requested.clone())
+                .collect(),
+            resolved_version: vendor.adapter_version.clone(),
+            rate_limit_remaining: 0,
+            error_rate: 0.0,
+            retry_count: 0,
+            cost_per_million_tokens_usd: 0.0,
+            routing_policy: vendor.adapter.clone(),
+        })
+        .collect()
+}
+
+fn tenant_policy_label(policy: TenantCachePolicy) -> &'static str {
+    match policy {
+        TenantCachePolicy::CacheFirst => "cache_first",
+        TenantCachePolicy::Bypass => "bypass",
+        TenantCachePolicy::CacheOnly => "cache_only",
     }
 }
 
@@ -259,6 +383,18 @@ async fn nodes(State(state): State<AdminHttpState>, headers: HeaderMap) -> Respo
         .into_response(),
         Err(error) => admin_error_response(error),
     }
+}
+
+async fn tenants(State(state): State<AdminHttpState>) -> Json<Vec<TenantHttpView>> {
+    Json((*state.tenants).clone())
+}
+
+async fn vendors(State(state): State<AdminHttpState>) -> Json<Vec<VendorHttpView>> {
+    Json((*state.vendors).clone())
+}
+
+async fn alerts() -> Json<Vec<Value>> {
+    Json(Vec::new())
 }
 
 async fn drain_node(
@@ -489,7 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_router_maps_admin_service_endpoints() {
-        let app = build_router();
+        let app = build_router(build_admin_state_for_test());
 
         let health = app
             .clone()
@@ -520,6 +656,51 @@ mod tests {
         let nodes_body = response_json(nodes).await;
         assert_eq!(nodes_body[0]["node_id"], json!("local-store"));
         assert_eq!(nodes_body[0]["draining"], json!(false));
+
+        let tenants = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/tenants")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("tenants request should complete");
+        assert_eq!(tenants.status(), StatusCode::OK);
+        let tenants_body = response_json(tenants).await;
+        assert_eq!(tenants_body[0]["tenantId"], json!("test-tenant"));
+        assert_eq!(tenants_body[0]["apiKeyRef"], json!("sha256:e46ea83e…"));
+        assert_eq!(tenants_body[0]["policy"], json!("cache_first"));
+
+        let vendors = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/vendors")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("vendors request should complete");
+        assert_eq!(vendors.status(), StatusCode::OK);
+        let vendors_body = response_json(vendors).await;
+        assert_eq!(vendors_body[0]["vendorId"], json!("mock"));
+        assert_eq!(vendors_body[0]["models"], json!(["gpt-test"]));
+        assert_eq!(vendors_body[0]["routingPolicy"], json!("mock"));
+
+        let alerts = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/alerts")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("alerts request should complete");
+        assert_eq!(alerts.status(), StatusCode::OK);
+        assert_eq!(response_json(alerts).await, json!([]));
 
         let debug = app
             .clone()

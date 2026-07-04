@@ -7,24 +7,26 @@
     "dev": "vite",
     "build": "npm run typecheck && vite build",
     "test": "vitest run",
+    "test:e2e": "playwright test",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json"
   },
   "dependencies": {
+    "@tanstack/react-query": "latest",
     "@vitejs/plugin-react": "latest",
-    "vite": "latest",
-    "typescript": "latest",
     "react": "latest",
     "react-dom": "latest",
-    "@tanstack/react-query": "latest"
+    "typescript": "latest",
+    "vite": "latest"
   },
   "devDependencies": {
-    "vitest": "latest",
-    "jsdom": "latest",
-    "@testing-library/react": "latest",
+    "@playwright/test": "^1.61.1",
     "@testing-library/jest-dom": "latest",
+    "@testing-library/react": "latest",
     "@testing-library/user-event": "latest",
+    "@types/node": "latest",
     "@types/react": "latest",
     "@types/react-dom": "latest",
-    "@types/node": "latest"
+    "jsdom": "latest",
+    "vitest": "latest"
   }
 }

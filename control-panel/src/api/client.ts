@@ -1,13 +1,15 @@
 import type {
   AdminMetricsSnapshot,
+  AlertView,
   AuditEvent,
   CacheDebugApiResponse,
   CacheDebugRequest,
   CacheDebugResponse,
   NodeView,
+  TenantView,
+  VendorView,
   WarmupCacheRequest,
 } from './types'
-
 const API_BASE_URL = import.meta.env.VITE_ADMIN_API_URL ?? '/admin'
 
 export class ApiError extends Error {
@@ -91,6 +93,18 @@ export function listNodes(): Promise<NodeView[]> {
   return fetchJson<NodeView[]>('/nodes')
 }
 
+export function listTenants(): Promise<TenantView[]> {
+  return fetchJson<TenantView[]>('/tenants')
+}
+
+export function listVendors(): Promise<VendorView[]> {
+  return fetchJson<VendorView[]>('/vendors')
+}
+
+export function listAlerts(): Promise<AlertView[]> {
+  return fetchJson<AlertView[]>('/alerts')
+}
+
 export async function debugCache(body: CacheDebugRequest): Promise<CacheDebugResponse> {
   const response = await fetchJson<CacheDebugApiResponse>('/cache/fingerprint/debug', {
     method: 'POST',
@@ -131,6 +145,9 @@ export const adminApi = {
   getAdminMetrics,
   listAuditEvents,
   listNodes,
+  listAlerts,
+  listTenants,
+  listVendors,
   purgeCacheObject,
   warmupCache,
 }

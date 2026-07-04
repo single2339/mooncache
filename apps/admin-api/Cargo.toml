@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 mooncache-admin-api = { path = "../../crates/admin-api" }
 mooncache-common = { path = "../../crates/common" }
+mooncache-gateway = { path = "../../crates/gateway" }
 mooncache-master = { path = "../../crates/master" }
 axum.workspace = true
 serde = { workspace = true, features = ["derive"] }

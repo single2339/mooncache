@@ -1,3 +1,5 @@
+import { useEffect, useState } from 'react'
+
 import type { AlertView } from '../api/types'
 
 interface AlertsProps {
@@ -9,6 +11,8 @@ const dateFormatter = new Intl.DateTimeFormat('en-US', {
   timeStyle: 'short',
   timeZone: 'UTC',
 })
+const pageSize = 10
+
 
 export function Alerts({ alerts }: AlertsProps) {
   const activeAlerts = alerts.filter((alert) => alert.status === 'active')
@@ -40,7 +44,18 @@ export function Alerts({ alerts }: AlertsProps) {
 }
 
 function AlertTable({ alerts, caption }: { alerts: AlertView[]; caption: string }) {
+  const [page, setPage] = useState(0)
+  useEffect(() => setPage(0), [alerts])
+
+  const pageCount = Math.max(1, Math.ceil(alerts.length / pageSize))
+  const safePage = Math.min(page, pageCount - 1)
+  const visibleAlerts = alerts.slice(safePage * pageSize, safePage * pageSize + pageSize)
+  const label = caption.toLowerCase()
+  const goToPreviousPage = () => setPage((currentPage) => Math.max(0, currentPage - 1))
+  const goToNextPage = () => setPage((currentPage) => Math.min(pageCount - 1, currentPage + 1))
+
   return (
+    <>
     <table>
       <caption>{caption}</caption>
       <thead>
@@ -54,7 +69,7 @@ function AlertTable({ alerts, caption }: { alerts: AlertView[]; caption: string 
         </tr>
       </thead>
       <tbody>
-        {alerts.map((alert) => (
+        {visibleAlerts.map((alert) => (
           <tr key={alert.id}>
             <td>{alert.severity}</td>
             <td>{alert.status}</td>
@@ -66,5 +81,19 @@ function AlertTable({ alerts, caption }: { alerts: AlertView[]; caption: string 
         ))}
       </tbody>
     </table>
+      {pageCount > 1 ? (
+        <nav className="pagination" aria-label={`${caption} pagination`}>
+          <button type="button" onClick={goToPreviousPage} disabled={safePage === 0}>
+            Previous {label}
+          </button>
+          <span>
+            Page {safePage + 1} of {pageCount}
+          </span>
+          <button type="button" onClick={goToNextPage} disabled={safePage === pageCount - 1}>
+            Next {label}
+          </button>
+        </nav>
+      ) : null}
+    </>
   )
 }
