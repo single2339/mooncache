@@ -9,7 +9,7 @@ pub enum ObjectStatus {
     Evicted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReplicaDescriptor {
     pub node_id: String,
     pub offset: u64,

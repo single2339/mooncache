@@ -9,7 +9,7 @@ use crate::object::ReplicaDescriptor;
 
 pub(crate) const DEFAULT_LEASE_TTL_MS: u64 = 5_000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Lease {
     pub lease_id: String,
     pub expires_at_ms: u64,
@@ -28,7 +28,7 @@ impl Lease {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReplicaList {
     pub replicas: Vec<ReplicaDescriptor>,
     pub lease: Lease,

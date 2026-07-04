@@ -20,8 +20,11 @@ mooncache-fingerprint = { path = "../fingerprint" }
 mooncache-master = { path = "../master" }
 mooncache-store = { path = "../store" }
 tokio = { workspace = true, features = ["sync"] }
+
 [dev-dependencies]
 tokio.workspace = true
+axum.workspace = true
+parking_lot.workspace = true
 
 [[test]]
 name = "cache_flow"
@@ -38,3 +41,7 @@ path = "../../tests/integration/e2e_cluster.rs"
 [[test]]
 name = "load_smoke"
 path = "../../tests/integration/load_smoke.rs"
+
+[[test]]
+name = "distributed_cache_flow"
+path = "../../tests/integration/distributed_cache_flow.rs"

@@ -1,8 +1,4 @@
-use std::{
-    borrow::Cow,
-    sync::{Arc, Mutex, MutexGuard},
-    time::Instant,
-};
+use std::{borrow::Cow, sync::Arc, time::Instant};
 
 use mooncache_common::{
     CacheError, CacheKey, CacheStatus as ObservedCacheStatus,
@@ -12,12 +8,13 @@ use mooncache_common::{
 use mooncache_fingerprint::{
     classify_request, compute_cache_key, EligibilityDecision, FingerprintInput,
 };
-use mooncache_master::{MasterState, ReplicaDescriptor};
+use mooncache_master::{MasterState, ReplicaDescriptor, ReplicaList};
 use mooncache_protocol::{CacheControl, CacheStatus, ResponsesRequest};
 use mooncache_store::{ChunkHandle, MemoryStore, StoreError};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::clients::{LocalMasterClient, LocalStoreClient, MasterClient, StoreClient};
 use crate::config::TenantConfigSet;
 use crate::routes::GatewayResponse;
 use crate::singleflight::{
@@ -32,8 +29,8 @@ const TEST_TENANT_ID: &str = "test-tenant";
 const REPLICA_COUNT: usize = 1;
 
 pub struct GatewayState {
-    master: Mutex<MasterState>,
-    store: Mutex<MemoryStore>,
+    master_client: Arc<dyn MasterClient>,
+    store_client: Arc<dyn StoreClient>,
     vendor: Arc<dyn VendorAdapter>,
     tenant_id: TenantId,
     tenant_configs: Option<TenantConfigSet>,
@@ -50,8 +47,8 @@ impl GatewayState {
     {
         let tenant_id = TenantId::parse(TEST_TENANT_ID).expect("test tenant id is valid");
         Self {
-            master: Mutex::new(master),
-            store: Mutex::new(store),
+            master_client: Arc::new(LocalMasterClient::new(master)),
+            store_client: Arc::new(LocalStoreClient::new(store)),
             vendor,
             tenant_id,
             tenant_configs: None,
@@ -77,8 +74,8 @@ impl GatewayState {
             .map(|tenant| tenant.id.clone())
             .unwrap_or_else(|| TenantId::parse(TEST_TENANT_ID).expect("test tenant id is valid"));
         Self {
-            master: Mutex::new(master),
-            store: Mutex::new(store),
+            master_client: Arc::new(LocalMasterClient::new(master)),
+            store_client: Arc::new(LocalStoreClient::new(store)),
             vendor,
             tenant_id,
             tenant_configs: Some(tenant_configs),
@@ -95,14 +92,37 @@ impl GatewayState {
     {
         let tenant_id = TenantId::parse(TEST_TENANT_ID).expect("test tenant id is valid");
         Self {
-            master: Mutex::new(MasterState::new_for_test()),
-            store: Mutex::new(MemoryStore::with_capacity(0)),
+            master_client: Arc::new(LocalMasterClient::new(MasterState::new_for_test())),
+            store_client: Arc::new(LocalStoreClient::new(MemoryStore::with_capacity(0))),
             vendor,
             tenant_id,
             tenant_configs: None,
             singleflight: SingleflightGroup::default(),
             metrics: GatewayMetrics::default(),
             cache_available: false,
+        }
+    }
+
+    /// Construct a GatewayState with arbitrary master and store clients (for remote/testing).
+    #[must_use]
+    pub fn new_with_clients<V>(
+        master_client: Arc<dyn MasterClient>,
+        store_client: Arc<dyn StoreClient>,
+        vendor: Arc<V>,
+    ) -> Self
+    where
+        V: VendorAdapter + 'static,
+    {
+        let tenant_id = TenantId::parse(TEST_TENANT_ID).expect("test tenant id is valid");
+        Self {
+            master_client,
+            store_client,
+            vendor,
+            tenant_id,
+            tenant_configs: None,
+            singleflight: SingleflightGroup::default(),
+            metrics: GatewayMetrics::default(),
+            cache_available: true,
         }
     }
 
@@ -125,12 +145,56 @@ impl GatewayState {
             .is_some_and(|tenant| tenant.allowed_vendors.iter().any(|id| id == vendor_id))
     }
 
-    fn master(&self) -> Result<MutexGuard<'_, MasterState>, GatewayError> {
-        self.master.lock().map_err(|_| GatewayError::PoisonedLock)
+    async fn master_get_replica_list(
+        &self,
+        tenant_id: &TenantId,
+        cache_key: &CacheKey,
+    ) -> Result<ReplicaList, GatewayError> {
+        self.master_client
+            .get_replica_list(tenant_id, cache_key)
+            .await
     }
 
-    fn store(&self) -> Result<MutexGuard<'_, MemoryStore>, GatewayError> {
-        self.store.lock().map_err(|_| GatewayError::PoisonedLock)
+    async fn master_put_start(
+        &self,
+        tenant_id: &TenantId,
+        cache_key: &CacheKey,
+        len: u64,
+        replica_count: usize,
+    ) -> Result<Vec<ReplicaDescriptor>, GatewayError> {
+        self.master_client
+            .put_start(tenant_id, cache_key, len, replica_count)
+            .await
+    }
+
+    async fn master_put_end(
+        &self,
+        tenant_id: &TenantId,
+        cache_key: &CacheKey,
+    ) -> Result<(), GatewayError> {
+        self.master_client.put_end(tenant_id, cache_key).await
+    }
+
+    async fn master_put_revoke(
+        &self,
+        tenant_id: &TenantId,
+        cache_key: &CacheKey,
+    ) -> Result<(), GatewayError> {
+        self.master_client.put_revoke(tenant_id, cache_key).await
+    }
+
+    async fn store_read_chunk(&self, handle: &ChunkHandle) -> Result<Vec<u8>, GatewayError> {
+        self.store_client.read_chunk(handle).await
+    }
+
+    async fn store_write_preallocated_chunk(
+        &self,
+        handle: &ChunkHandle,
+        bytes: &[u8],
+    ) -> Result<(), GatewayError> {
+        self.store_client
+            .write_preallocated_chunk(handle, bytes)
+            .await
     }
 
     fn cache_available(&self) -> bool {
@@ -162,6 +226,10 @@ pub enum GatewayError {
     },
     #[error("singleflight leader failed: {0}")]
     SingleflightLeaderFailed(String),
+    #[error("master upstream error: {0}")]
+    MasterUpstream(String),
+    #[error("store upstream error: {0}")]
+    StoreUpstream(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,7 +368,7 @@ pub async fn handle_response_request(
     }
 
     if !matches!(cache_control, CacheControl::WriteOnly) {
-        if let Some(cached_body) = read_cached_body(state, &tenant_id, &cache_key)? {
+        if let Some(cached_body) = read_cached_body(state, &tenant_id, &cache_key).await? {
             record_simple(CacheStatus::Hit, CacheWriteStatus::Skipped);
             return Ok(GatewayResponse::ok(
                 cached_body,
@@ -387,6 +455,7 @@ async fn cacheable_non_streaming_miss(
         CacheWriteStatus::Skipped
     } else {
         write_cached_body(state, &tenant_id, &cache_key, &vendor_response.body)
+            .await
             .unwrap_or(CacheWriteStatus::Failed)
     };
     record_gateway_metrics(state, CacheStatus::Miss, write_status);
@@ -431,7 +500,9 @@ async fn streaming_response(
     }
 
     if !matches!(cache_control, CacheControl::WriteOnly) {
-        if let Some(cached_stream) = read_cached_stream_object(state, &tenant_id, &cache_key)? {
+        if let Some(cached_stream) =
+            read_cached_stream_object(state, &tenant_id, &cache_key).await?
+        {
             record_gateway_metrics(state, CacheStatus::Hit, CacheWriteStatus::Skipped);
             state.metrics.record_singleflight(SingleflightRole::None);
             return Ok(GatewayResponse::ok_stream(
@@ -466,6 +537,7 @@ async fn streaming_response(
         CacheWriteStatus::Skipped
     } else {
         write_cached_stream_object(state, &tenant_id, &cache_key, &captured)
+            .await
             .unwrap_or(CacheWriteStatus::Failed)
     };
     record_gateway_metrics(state, CacheStatus::Miss, write_status);
@@ -523,74 +595,67 @@ async fn vendor_response(
     ))
 }
 
-fn read_cached_body(
+async fn read_cached_body(
     state: &GatewayState,
     tenant_id: &TenantId,
     cache_key: &CacheKey,
 ) -> Result<Option<Value>, GatewayError> {
-    let Some(bytes) = read_cached_bytes(state, tenant_id, cache_key)? else {
+    let Some(bytes) = read_cached_bytes(state, tenant_id, cache_key).await? else {
         return Ok(None);
     };
     Ok(Some(streaming::cached_body_from_bytes(&bytes)?))
 }
 
-fn read_cached_stream_object(
+async fn read_cached_stream_object(
     state: &GatewayState,
     tenant_id: &TenantId,
     cache_key: &CacheKey,
 ) -> Result<Option<CachedStreamObject>, GatewayError> {
-    let Some(bytes) = read_cached_bytes(state, tenant_id, cache_key)? else {
+    let Some(bytes) = read_cached_bytes(state, tenant_id, cache_key).await? else {
         return Ok(None);
     };
     streaming::stream_object_from_bytes(&bytes).map_err(GatewayError::from)
 }
 
-fn read_cached_bytes(
+async fn read_cached_bytes(
     state: &GatewayState,
     tenant_id: &TenantId,
     cache_key: &CacheKey,
 ) -> Result<Option<Vec<u8>>, GatewayError> {
-    let replica = {
-        let mut master = state.master()?;
-        match master.get_replica_list(tenant_id, cache_key) {
-            Ok(replica_list) => replica_list.replicas.into_iter().next(),
-            Err(CacheError::NotFound) => return Ok(None),
-            Err(err) => return Err(err.into()),
-        }
+    let replica = match state.master_get_replica_list(tenant_id, cache_key).await {
+        Ok(replica_list) => replica_list.replicas.into_iter().next(),
+        Err(GatewayError::Cache(CacheError::NotFound)) => return Ok(None),
+        Err(err) => return Err(err),
     };
 
     let Some(replica) = replica else {
         return Ok(None);
     };
     let handle = ChunkHandle::from_replica(&replica)?;
-    state
-        .store()?
-        .read_chunk(&handle)
-        .map(Some)
-        .map_err(Into::into)
+    state.store_read_chunk(&handle).await.map(Some)
 }
 
-fn write_cached_body(
+async fn write_cached_body(
     state: &GatewayState,
     tenant_id: &TenantId,
     cache_key: &CacheKey,
     body: &Value,
 ) -> Result<CacheWriteStatus, GatewayError> {
     let bytes = serde_json::to_vec(body)?;
-    write_cached_bytes(state, tenant_id, cache_key, &bytes)
+    write_cached_bytes(state, tenant_id, cache_key, &bytes).await
 }
 
-fn write_cached_stream_object(
+async fn write_cached_stream_object(
     state: &GatewayState,
     tenant_id: &TenantId,
     cache_key: &CacheKey,
     captured: &CapturedStream,
 ) -> Result<CacheWriteStatus, GatewayError> {
     let bytes = streaming::serialize_stream_object(captured)?;
-    write_cached_bytes(state, tenant_id, cache_key, &bytes)
+    write_cached_bytes(state, tenant_id, cache_key, &bytes).await
 }
 
-fn write_cached_bytes(
+async fn write_cached_bytes(
     state: &GatewayState,
     tenant_id: &TenantId,
     cache_key: &CacheKey,
@@ -600,56 +665,39 @@ fn write_cached_bytes(
         CacheError::Conflict("response body is too large to cache on this platform".to_owned())
     })?;
 
-    let replicas = {
-        let mut master = state.master()?;
-        master.put_start(tenant_id, cache_key, len, REPLICA_COUNT)?
-    };
+    let replicas = state
+        .master_put_start(tenant_id, cache_key, len, REPLICA_COUNT)
+        .await?;
 
-    if let Err(err) = write_reserved_replicas(state, &replicas, bytes) {
-        return Err(revoke_reservation_after_write_failure(
-            state, tenant_id, cache_key, err,
-        ));
+    if let Err(err) = write_reserved_replicas(state, &replicas, bytes).await {
+        return Err(revoke_reservation_after_write_failure(state, tenant_id, cache_key, err).await);
     }
 
-    let put_end_result = state.master().and_then(|mut master| {
-        master
-            .put_end(tenant_id, cache_key)
-            .map_err(GatewayError::from)
-    });
-    if let Err(err) = put_end_result {
-        return Err(revoke_reservation_after_write_failure(
-            state, tenant_id, cache_key, err,
-        ));
+    if let Err(err) = state.master_put_end(tenant_id, cache_key).await {
+        return Err(revoke_reservation_after_write_failure(state, tenant_id, cache_key, err).await);
     }
     Ok(CacheWriteStatus::Committed)
 }
 
-fn write_reserved_replicas(
+async fn write_reserved_replicas(
     state: &GatewayState,
     replicas: &[ReplicaDescriptor],
     bytes: &[u8],
 ) -> Result<(), GatewayError> {
-    let mut store = state.store()?;
     for replica in replicas {
         let handle = ChunkHandle::from_replica(replica)?;
-        store.write_preallocated_chunk(&handle, bytes)?;
+        state.store_write_preallocated_chunk(&handle, bytes).await?;
     }
     Ok(())
 }
 
-fn revoke_reservation_after_write_failure(
+async fn revoke_reservation_after_write_failure(
     state: &GatewayState,
     tenant_id: &TenantId,
     cache_key: &CacheKey,
     write_error: GatewayError,
 ) -> GatewayError {
-    let revoke_result = state.master().and_then(|mut master| {
-        master
-            .put_revoke(tenant_id, cache_key)
-            .map_err(GatewayError::from)
-    });
-
-    match revoke_result {
+    match state.master_put_revoke(tenant_id, cache_key).await {
         Ok(()) => write_error,
         Err(revoke_error) => GatewayError::ReservationRevokeFailed {
             write_error: write_error.to_string(),

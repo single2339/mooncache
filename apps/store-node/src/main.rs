@@ -1,7 +1,14 @@
 use std::{env, process::ExitCode, sync::Arc};
 
-use axum::{extract::State, routing::get, Json, Router};
-use mooncache_store::MemoryStore;
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    routing::get,
+    Json, Router,
+};
+use mooncache_store::{ChunkHandle, MemoryStore, StoreError};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
@@ -29,6 +36,38 @@ enum ParsedConfig {
     Help,
     Run(AppConfig),
 }
+
+type AppState = Arc<Mutex<MemoryStore>>;
+
+// ── DTOs ────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct WriteChunkRequest {
+    len: usize,
+    data: Vec<u8>,
+}
+#[derive(Debug, Deserialize)]
+struct PreallocatedWriteRequest {
+    offset: usize,
+    len: usize,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+struct WriteChunkResponse {
+    ok: bool,
+    offset: usize,
+    len: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadChunkResponse {
+    offset: usize,
+    len: usize,
+    data: Vec<u8>,
+}
+
+// ── Entrypoint ───────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -144,6 +183,8 @@ fn print_resolved_config(config: &AppConfig) {
     );
 }
 
+// ── Server ───────────────────────────────────────────────────────
+
 async fn run_server(config: AppConfig) -> Result<(), String> {
     print_resolved_config(&config);
     let listener = TcpListener::bind(&config.bind_addr)
@@ -159,19 +200,90 @@ async fn run_server(config: AppConfig) -> Result<(), String> {
 }
 
 fn build_router() -> Router {
+    build_router_with_state(Arc::new(Mutex::new(MemoryStore::with_capacity(1_048_576))))
+}
+
+fn build_router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics/snapshot", get(metrics_snapshot))
-        .with_state(Arc::new(MemoryStore::with_capacity(1_048_576)))
+        .route("/chunks/{offset}/{len}", get(get_chunk))
+        .route("/chunks", axum::routing::post(post_chunk))
+        .route(
+            "/chunks/preallocated",
+            axum::routing::post(post_chunk_preallocated),
+        )
+        .with_state(state)
 }
+
+// ── Handlers ─────────────────────────────────────────────────────
 
 async fn healthz() -> Json<Value> {
     Json(json!({"ok": true, "service": SERVICE_NAME}))
 }
 
-async fn metrics_snapshot(State(state): State<Arc<MemoryStore>>) -> Json<Value> {
-    Json(json!(state.capacity_snapshot()))
+async fn metrics_snapshot(State(state): State<AppState>) -> Json<Value> {
+    let snapshot = state.lock().capacity_snapshot();
+    Json(json!(snapshot))
 }
+
+async fn post_chunk(
+    State(state): State<AppState>,
+    Json(req): Json<WriteChunkRequest>,
+) -> Result<Json<WriteChunkResponse>, (StatusCode, Json<Value>)> {
+    let mut store = state.lock();
+    let handle = store.allocate(req.len).map_err(store_error_to_response)?;
+    store
+        .write_chunk(&handle, &req.data)
+        .map_err(store_error_to_response)?;
+    Ok(Json(WriteChunkResponse {
+        ok: true,
+        offset: handle.offset(),
+        len: handle.len(),
+    }))
+}
+
+async fn post_chunk_preallocated(
+    State(state): State<AppState>,
+    Json(req): Json<PreallocatedWriteRequest>,
+) -> Result<Json<WriteChunkResponse>, (StatusCode, Json<Value>)> {
+    let handle = ChunkHandle::new(req.offset, req.len);
+    let mut store = state.lock();
+    store
+        .write_preallocated_chunk(&handle, &req.data)
+        .map_err(store_error_to_response)?;
+    Ok(Json(WriteChunkResponse {
+        ok: true,
+        offset: handle.offset(),
+        len: handle.len(),
+    }))
+}
+
+async fn get_chunk(
+    State(state): State<AppState>,
+    Path((offset, len)): Path<(usize, usize)>,
+) -> Result<Json<ReadChunkResponse>, (StatusCode, Json<Value>)> {
+    let handle = ChunkHandle::new(offset, len);
+    let store = state.lock();
+    let data = store.read_chunk(&handle).map_err(store_error_to_response)?;
+    // Drop the lock before building the response
+    drop(store);
+    Ok(Json(ReadChunkResponse { offset, len, data }))
+}
+
+// ── Error mapping ────────────────────────────────────────────────
+
+fn store_error_to_response(error: StoreError) -> (StatusCode, Json<Value>) {
+    let code = match &error {
+        StoreError::EmptyChunk | StoreError::LengthMismatch { .. } => StatusCode::BAD_REQUEST,
+        StoreError::InsufficientCapacity { .. } => StatusCode::INSUFFICIENT_STORAGE,
+        StoreError::InvalidHandle { .. } | StoreError::UnwrittenChunk => StatusCode::NOT_FOUND,
+        StoreError::ChecksumMismatch { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (code, Json(json!({"error": error.to_string()})))
+}
+
+// ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -183,6 +295,8 @@ mod tests {
     };
     use serde_json::{json, Value};
     use tower::ServiceExt;
+
+    // ── CLI tests (preserved from original) ──────────────────────
 
     #[test]
     fn cli_flags_override_defaults() {
@@ -227,12 +341,13 @@ mod tests {
         assert_eq!(error, "--bind-addr requires a value");
     }
 
+    // ── HTTP endpoint tests ─────────────────────────────────────
+
     #[tokio::test]
-    async fn http_router_serves_health_and_capacity_snapshot() {
+    async fn healthz_returns_ok_and_service_name() {
         let app = build_router();
 
-        let health = app
-            .clone()
+        let response = app
             .oneshot(
                 Request::builder()
                     .uri("/healthz")
@@ -241,12 +356,18 @@ mod tests {
             )
             .await
             .expect("health request should complete");
-        assert_eq!(health.status(), StatusCode::OK);
-        let health_body = response_json(health).await;
-        assert_eq!(health_body["ok"], json!(true));
-        assert_eq!(health_body["service"], json!(SERVICE_NAME));
 
-        let snapshot = app
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["service"], json!(SERVICE_NAME));
+    }
+
+    #[tokio::test]
+    async fn metrics_snapshot_returns_zero_initially() {
+        let app = build_router();
+
+        let response = app
             .oneshot(
                 Request::builder()
                     .uri("/metrics/snapshot")
@@ -255,11 +376,189 @@ mod tests {
             )
             .await
             .expect("snapshot request should complete");
-        assert_eq!(snapshot.status(), StatusCode::OK);
-        let snapshot_body = response_json(snapshot).await;
-        assert_eq!(snapshot_body["dram_bytes_used"], json!(0));
-        assert_eq!(snapshot_body["dram_bytes_capacity"], json!(1_048_576));
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["dram_bytes_used"], json!(0));
+        assert_eq!(body["dram_bytes_capacity"], json!(1_048_576));
+        assert_eq!(body["ssd_bytes_used"], json!(0));
+        assert_eq!(body["ssd_bytes_capacity"], json!(0));
     }
+
+    #[tokio::test]
+    async fn write_chunk_then_read_chunk_roundtrip() {
+        let app = build_router();
+        let payload = b"hello store node";
+
+        // Write
+        let write_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chunks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"len": payload.len(), "data": payload.to_vec()}).to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("write should complete");
+
+        assert_eq!(write_resp.status(), StatusCode::OK);
+        let write_body = response_json(write_resp).await;
+        assert_eq!(write_body["ok"], json!(true));
+        assert_eq!(write_body["offset"], json!(0));
+        assert_eq!(write_body["len"], json!(payload.len()));
+
+        // Read
+        let read_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/chunks/0/{}", payload.len()))
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("read should complete");
+
+        assert_eq!(read_resp.status(), StatusCode::OK);
+        let read_body = response_json(read_resp).await;
+        assert_eq!(read_body["offset"], json!(0));
+        assert_eq!(read_body["len"], json!(payload.len()));
+        let returned: Vec<u8> =
+            serde_json::from_value(read_body["data"].clone()).expect("data should be bytes");
+        assert_eq!(returned, payload.to_vec());
+    }
+
+    #[tokio::test]
+    async fn read_missing_chunk_returns_not_found() {
+        let app = build_router();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/chunks/999/5")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("read should complete");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn read_unwritten_chunk_returns_not_found() {
+        let app = build_router();
+
+        // Allocate a slot by writing a different chunk first
+        let app = app;
+        let _write = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chunks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"len": 3, "data": [1, 2, 3]}).to_string()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("write should complete");
+
+        // Read at offset 4 (past allocated area) — not found
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/chunks/4/2")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("read should complete");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn write_empty_chunk_returns_bad_request() {
+        let app = build_router();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chunks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"len": 0, "data": []}).to_string()))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("write should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn write_length_mismatch_returns_bad_request() {
+        let app = build_router();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chunks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"len": 10, "data": [1, 2, 3]}).to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("write should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn metrics_reflects_written_data() {
+        let app = build_router();
+        let payload = b"capacity check";
+
+        let _write = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chunks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"len": payload.len(), "data": payload.to_vec()}).to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("write should complete");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics/snapshot")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("snapshot should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["dram_bytes_used"], json!(payload.len()));
+        assert_eq!(body["dram_bytes_capacity"], json!(1_048_576));
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────
 
     async fn response_json(response: axum::response::Response) -> Value {
         let bytes = to_bytes(response.into_body(), usize::MAX)
