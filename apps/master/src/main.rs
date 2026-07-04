@@ -1,13 +1,15 @@
 use std::{env, process::ExitCode, sync::Arc};
 
+use async_trait::async_trait;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
     routing::{delete, get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use mooncache_common::{CacheError, CacheKey, TenantId};
-use mooncache_master::MasterState;
+use mooncache_master::{MasterMetadataSnapshot, MasterState};
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -159,9 +161,9 @@ fn print_resolved_config(config: &AppConfig) {
 // ---------------------------------------------------------------------------
 // server + router
 // ---------------------------------------------------------------------------
-
 async fn run_server(config: AppConfig) -> Result<(), String> {
     print_resolved_config(&config);
+    let router = build_router_from_config(&config).await?;
     let listener = TcpListener::bind(&config.bind_addr)
         .await
         .map_err(|error| format!("failed to bind {}: {error}", config.bind_addr))?;
@@ -169,23 +171,274 @@ async fn run_server(config: AppConfig) -> Result<(), String> {
         .local_addr()
         .map_err(|error| format!("failed to read bound address: {error}"))?;
     println!("{SERVICE_NAME} listening on {local_addr}");
-    axum::serve(listener, build_router())
+    axum::serve(listener, router)
         .await
         .map_err(|error| format!("server error: {error}"))
 }
 
-type AppState = Arc<Mutex<MasterState>>;
+type AppState = Arc<MasterAppState>;
 
-fn build_router() -> Router {
-    let mut state = MasterState::new_for_test();
-    state.mount_segment("default", 1_048_576);
-    build_router_with_state(Arc::new(Mutex::new(state)))
+struct MasterAppState {
+    master: Arc<Mutex<MasterState>>,
+    metadata: Arc<dyn MetadataStore>,
+    leadership: LeadershipState,
 }
 
-fn build_router_with_state(state: AppState) -> Router {
+#[async_trait]
+trait MetadataStore: Send + Sync {
+    async fn load(&self) -> Result<Option<MasterMetadataSnapshot>, String>;
+    async fn save(&self, snapshot: &MasterMetadataSnapshot) -> Result<(), String>;
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MemoryMetadataStore {
+    snapshot: Mutex<Option<MasterMetadataSnapshot>>,
+}
+
+#[cfg(test)]
+#[async_trait]
+impl MetadataStore for MemoryMetadataStore {
+    async fn load(&self) -> Result<Option<MasterMetadataSnapshot>, String> {
+        Ok(self.snapshot.lock().clone())
+    }
+
+    async fn save(&self, snapshot: &MasterMetadataSnapshot) -> Result<(), String> {
+        *self.snapshot.lock() = Some(snapshot.clone());
+        Ok(())
+    }
+}
+
+struct EtcdMetadataStore {
+    client: reqwest::Client,
+    base_url: String,
+    metadata_key: String,
+    leader_key: String,
+}
+
+impl EtcdMetadataStore {
+    fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            metadata_key: "/mooncache/master/metadata".to_string(),
+            leader_key: "/mooncache/master/leader".to_string(),
+        }
+    }
+
+    async fn elect_leader(&self, local_id: &str) -> Result<LeadershipState, String> {
+        let response: EtcdTxnResponse = self
+            .client
+            .post(format!("{}/v3/kv/txn", self.base_url))
+            .json(&json!({
+                "compare": [{
+                    "key": etcd_b64(&self.leader_key),
+                    "target": "CREATE",
+                    "create_revision": "0",
+                    "result": "EQUAL"
+                }],
+                "success": [{
+                    "request_put": {
+                        "key": etcd_b64(&self.leader_key),
+                        "value": etcd_b64(local_id)
+                    }
+                }],
+                "failure": [{
+                    "request_range": {
+                        "key": etcd_b64(&self.leader_key)
+                    }
+                }]
+            }))
+            .send()
+            .await
+            .map_err(|error| format!("etcd leader election request failed: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("etcd leader election failed: {error}"))?
+            .json()
+            .await
+            .map_err(|error| format!("invalid etcd leader response: {error}"))?;
+
+        if response.succeeded {
+            Ok(LeadershipState::leader(local_id))
+        } else {
+            let leader_id = response
+                .responses
+                .into_iter()
+                .find_map(|response| response.response_range)
+                .and_then(|range| range.kvs.into_iter().next())
+                .map(|kv| etcd_decode_utf8(&kv.value))
+                .transpose()?
+                .unwrap_or_else(|| local_id.to_string());
+            Ok(LeadershipState::standby(local_id, leader_id))
+        }
+    }
+}
+
+#[async_trait]
+impl MetadataStore for EtcdMetadataStore {
+    async fn load(&self) -> Result<Option<MasterMetadataSnapshot>, String> {
+        let response: EtcdRangeResponse = self
+            .client
+            .post(format!("{}/v3/kv/range", self.base_url))
+            .json(&json!({"key": etcd_b64(&self.metadata_key)}))
+            .send()
+            .await
+            .map_err(|error| format!("etcd metadata load request failed: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("etcd metadata load failed: {error}"))?
+            .json()
+            .await
+            .map_err(|error| format!("invalid etcd metadata response: {error}"))?;
+
+        let Some(kv) = response.kvs.into_iter().next() else {
+            return Ok(None);
+        };
+        let bytes = etcd_decode(&kv.value)?;
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| format!("invalid persisted master metadata: {error}"))
+    }
+
+    async fn save(&self, snapshot: &MasterMetadataSnapshot) -> Result<(), String> {
+        let bytes = serde_json::to_vec(snapshot)
+            .map_err(|error| format!("failed to encode master metadata: {error}"))?;
+        self.client
+            .post(format!("{}/v3/kv/put", self.base_url))
+            .json(&json!({
+                "key": etcd_b64(&self.metadata_key),
+                "value": BASE64.encode(bytes),
+            }))
+            .send()
+            .await
+            .map_err(|error| format!("etcd metadata save request failed: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("etcd metadata save failed: {error}"))?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EtcdRangeResponse {
+    #[serde(default)]
+    kvs: Vec<EtcdKv>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EtcdTxnResponse {
+    succeeded: bool,
+    #[serde(default)]
+    responses: Vec<EtcdTxnOpResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EtcdTxnOpResponse {
+    response_range: Option<EtcdRangeResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EtcdKv {
+    value: String,
+}
+
+fn etcd_b64(value: &str) -> String {
+    BASE64.encode(value.as_bytes())
+}
+
+fn etcd_decode(value: &str) -> Result<Vec<u8>, String> {
+    BASE64
+        .decode(value)
+        .map_err(|error| format!("invalid base64 from etcd: {error}"))
+}
+
+fn etcd_decode_utf8(value: &str) -> Result<String, String> {
+    String::from_utf8(etcd_decode(value)?)
+        .map_err(|error| format!("invalid utf8 from etcd: {error}"))
+}
+
+async fn ha_status(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({
+        "local_id": state.leadership.local_id,
+        "leader_id": state.leadership.leader_id,
+        "is_leader": state.leadership.is_leader(),
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LeadershipState {
+    local_id: String,
+    leader_id: String,
+}
+
+impl LeadershipState {
+    fn leader(local_id: impl Into<String>) -> Self {
+        let local_id = local_id.into();
+        Self {
+            leader_id: local_id.clone(),
+            local_id,
+        }
+    }
+
+    fn standby(local_id: impl Into<String>, leader_id: impl Into<String>) -> Self {
+        Self {
+            local_id: local_id.into(),
+            leader_id: leader_id.into(),
+        }
+    }
+
+    fn is_leader(&self) -> bool {
+        self.local_id == self.leader_id
+    }
+}
+
+async fn build_router_from_config(config: &AppConfig) -> Result<Router, String> {
+    let metadata = Arc::new(EtcdMetadataStore::new(config.etcd_url.clone()));
+    let leadership = metadata.elect_leader(&config.bind_addr).await?;
+    let mut state = metadata
+        .load()
+        .await?
+        .map(MasterState::from_metadata_snapshot)
+        .unwrap_or_else(MasterState::new_for_test);
+    state.mount_segment("default", 1_048_576);
+    Ok(build_router_with_app_state(Arc::new(MasterAppState {
+        master: Arc::new(Mutex::new(state)),
+        metadata,
+        leadership,
+    })))
+}
+
+#[cfg(test)]
+fn build_router_with_state(master: Arc<Mutex<MasterState>>) -> Router {
+    build_router_with_app_state(Arc::new(MasterAppState {
+        master,
+        metadata: Arc::new(MemoryMetadataStore::default()),
+        leadership: LeadershipState::leader("local"),
+    }))
+}
+
+#[cfg(test)]
+fn build_router_with_metadata(
+    metadata: Arc<MemoryMetadataStore>,
+    leadership: LeadershipState,
+) -> Router {
+    let mut state = metadata
+        .snapshot
+        .lock()
+        .clone()
+        .map(MasterState::from_metadata_snapshot)
+        .unwrap_or_else(MasterState::new_for_test);
+    state.mount_segment("node-0", 1_048_576);
+    build_router_with_app_state(Arc::new(MasterAppState {
+        master: Arc::new(Mutex::new(state)),
+        metadata,
+        leadership,
+    }))
+}
+
+fn build_router_with_app_state(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics/snapshot", get(metrics_snapshot))
+        .route("/ha/status", get(ha_status))
         .route("/objects/start", post(put_start))
         .route("/objects/end", post(put_end))
         .route("/objects/revoke", post(put_revoke))
@@ -199,6 +452,26 @@ fn build_router_with_state(state: AppState) -> Router {
 // ---------------------------------------------------------------------------
 // request DTOs
 // ---------------------------------------------------------------------------
+fn require_leader(state: &AppState) -> Result<(), (StatusCode, Json<Value>)> {
+    if state.leadership.is_leader() {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "master is not leader"})),
+        ))
+    }
+}
+
+async fn persist_metadata(state: &AppState) -> Result<(), (StatusCode, Json<Value>)> {
+    let snapshot = state.master.lock().metadata_snapshot();
+    state.metadata.save(&snapshot).await.map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": format!("metadata persistence failed: {error}")})),
+        )
+    })
+}
 
 #[derive(Debug, Deserialize)]
 struct PutStartRequest {
@@ -242,7 +515,7 @@ async fn healthz() -> Json<Value> {
 }
 
 async fn metrics_snapshot(State(state): State<AppState>) -> Json<Value> {
-    let snapshot = state.lock().observability_snapshot();
+    let snapshot = state.master.lock().observability_snapshot();
     Json(json!(snapshot))
 }
 
@@ -250,6 +523,9 @@ async fn put_start(
     State(state): State<AppState>,
     Json(body): Json<PutStartRequest>,
 ) -> (StatusCode, Json<Value>) {
+    if let Err(response) = require_leader(&state) {
+        return response;
+    }
     let tenant_id = match TenantId::parse(&body.tenant_id) {
         Ok(id) => id,
         Err(err) => return error_response(err),
@@ -258,11 +534,16 @@ async fn put_start(
         Ok(key) => key,
         Err(err) => return error_response(err),
     };
-    match state
-        .lock()
-        .put_start(&tenant_id, &cache_key, body.len, body.replica_count)
-    {
-        Ok(replicas) => (StatusCode::OK, Json(json!({"replicas": replicas}))),
+    let result =
+        state
+            .master
+            .lock()
+            .put_start(&tenant_id, &cache_key, body.len, body.replica_count);
+    match result {
+        Ok(replicas) => match persist_metadata(&state).await {
+            Ok(()) => (StatusCode::OK, Json(json!({"replicas": replicas}))),
+            Err(response) => response,
+        },
         Err(err) => error_response(err),
     }
 }
@@ -271,6 +552,9 @@ async fn put_end(
     State(state): State<AppState>,
     Json(body): Json<PutEndRequest>,
 ) -> (StatusCode, Json<Value>) {
+    if let Err(response) = require_leader(&state) {
+        return response;
+    }
     let tenant_id = match TenantId::parse(&body.tenant_id) {
         Ok(id) => id,
         Err(err) => return error_response(err),
@@ -279,8 +563,12 @@ async fn put_end(
         Ok(key) => key,
         Err(err) => return error_response(err),
     };
-    match state.lock().put_end(&tenant_id, &cache_key) {
-        Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))),
+    let result = state.master.lock().put_end(&tenant_id, &cache_key);
+    match result {
+        Ok(()) => match persist_metadata(&state).await {
+            Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))),
+            Err(response) => response,
+        },
         Err(err) => error_response(err),
     }
 }
@@ -289,6 +577,9 @@ async fn put_revoke(
     State(state): State<AppState>,
     Json(body): Json<PutEndRequest>,
 ) -> (StatusCode, Json<Value>) {
+    if let Err(response) = require_leader(&state) {
+        return response;
+    }
     let tenant_id = match TenantId::parse(&body.tenant_id) {
         Ok(id) => id,
         Err(err) => return error_response(err),
@@ -297,8 +588,12 @@ async fn put_revoke(
         Ok(key) => key,
         Err(err) => return error_response(err),
     };
-    match state.lock().put_revoke(&tenant_id, &cache_key) {
-        Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))),
+    let result = state.master.lock().put_revoke(&tenant_id, &cache_key);
+    match result {
+        Ok(()) => match persist_metadata(&state).await {
+            Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))),
+            Err(response) => response,
+        },
         Err(err) => error_response(err),
     }
 }
@@ -315,7 +610,7 @@ async fn get_replica_list(
         Ok(key) => key,
         Err(err) => return error_response(err),
     };
-    match state.lock().get_replica_list(&tenant_id, &cache_key) {
+    match state.master.lock().get_replica_list(&tenant_id, &cache_key) {
         Ok(replica_list) => (StatusCode::OK, Json(json!(replica_list))),
         Err(err) => error_response(err),
     }
@@ -325,6 +620,9 @@ async fn remove_object(
     State(state): State<AppState>,
     Query(query): Query<ReplicaListQuery>,
 ) -> (StatusCode, Json<Value>) {
+    if let Err(response) = require_leader(&state) {
+        return response;
+    }
     let tenant_id = match TenantId::parse(&query.tenant_id) {
         Ok(id) => id,
         Err(err) => return error_response(err),
@@ -333,8 +631,12 @@ async fn remove_object(
         Ok(key) => key,
         Err(err) => return error_response(err),
     };
-    match state.lock().remove(&tenant_id, &cache_key) {
-        Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))),
+    let result = state.master.lock().remove(&tenant_id, &cache_key);
+    match result {
+        Ok(()) => match persist_metadata(&state).await {
+            Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))),
+            Err(response) => response,
+        },
         Err(err) => error_response(err),
     }
 }
@@ -343,11 +645,19 @@ async fn set_tenant_quota(
     State(state): State<AppState>,
     Json(body): Json<SetQuotaRequest>,
 ) -> (StatusCode, Json<Value>) {
-    match state
-        .lock()
-        .set_tenant_quota(&body.tenant_id, body.dram_bytes, body.ssd_bytes)
-    {
-        Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))),
+    if let Err(response) = require_leader(&state) {
+        return response;
+    }
+    let result =
+        state
+            .master
+            .lock()
+            .set_tenant_quota(&body.tenant_id, body.dram_bytes, body.ssd_bytes);
+    match result {
+        Ok(()) => match persist_metadata(&state).await {
+            Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))),
+            Err(response) => response,
+        },
         Err(err) => error_response(err),
     }
 }
@@ -356,8 +666,16 @@ async fn mount_segment(
     State(state): State<AppState>,
     Json(body): Json<MountSegmentRequest>,
 ) -> (StatusCode, Json<Value>) {
-    state.lock().mount_segment(&body.node_id, body.len);
-    (StatusCode::OK, Json(json!({"ok": true})))
+    if let Err(response) = require_leader(&state) {
+        return response;
+    }
+    {
+        state.master.lock().mount_segment(&body.node_id, body.len);
+    }
+    match persist_metadata(&state).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"ok": true}))),
+        Err(response) => response,
+    }
 }
 
 fn error_response(err: CacheError) -> (StatusCode, Json<Value>) {
@@ -437,6 +755,25 @@ mod tests {
             .uri(path_and_query)
             .body(Body::empty())
             .expect("request should build")
+    }
+
+    #[tokio::test]
+    async fn ha_status_reports_local_and_leader_ids() {
+        let app = build_router_with_metadata(
+            Arc::new(MemoryMetadataStore::default()),
+            LeadershipState::standby("master-b", "master-a"),
+        );
+
+        let response = app
+            .oneshot(get_uri("/ha/status"))
+            .await
+            .expect("ha status should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["local_id"], json!("master-b"));
+        assert_eq!(body["leader_id"], json!("master-a"));
+        assert_eq!(body["is_leader"], json!(false));
     }
 
     // -----------------------------------------------------------------------
@@ -965,5 +1302,63 @@ mod tests {
             .await
             .expect("get_replica_list after revoke");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn committed_metadata_is_persisted_and_loaded_by_next_master() {
+        let metadata = Arc::new(MemoryMetadataStore::default());
+        let leader =
+            build_router_with_metadata(metadata.clone(), LeadershipState::leader("master-a"));
+
+        let start = leader
+            .clone()
+            .oneshot(post_json(
+                "/objects/start",
+                json!({"tenant_id": "t1", "cache_key": KEY_A, "len": 4096, "replica_count": 1}),
+            ))
+            .await
+            .expect("put_start should complete");
+        assert_eq!(start.status(), StatusCode::OK);
+
+        let end = leader
+            .oneshot(post_json(
+                "/objects/end",
+                json!({"tenant_id": "t1", "cache_key": KEY_A}),
+            ))
+            .await
+            .expect("put_end should complete");
+        assert_eq!(end.status(), StatusCode::OK);
+
+        let follower = build_router_with_metadata(metadata, LeadershipState::leader("master-b"));
+        let response = follower
+            .oneshot(get_uri(&format!(
+                "/objects/replicas?tenant_id=t1&cache_key={KEY_A}"
+            )))
+            .await
+            .expect("get_replica_list should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["replicas"][0]["node_id"], json!("node-0"));
+    }
+
+    #[tokio::test]
+    async fn standby_master_rejects_mutating_requests() {
+        let app = build_router_with_metadata(
+            Arc::new(MemoryMetadataStore::default()),
+            LeadershipState::standby("master-b", "master-a"),
+        );
+
+        let response = app
+            .oneshot(post_json(
+                "/objects/start",
+                json!({"tenant_id": "t1", "cache_key": KEY_A, "len": 4096, "replica_count": 1}),
+            ))
+            .await
+            .expect("put_start should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response_json(response).await;
+        assert_eq!(body["error"], json!("master is not leader"));
     }
 }

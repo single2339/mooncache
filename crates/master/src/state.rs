@@ -10,6 +10,13 @@ use crate::{
     quota::TenantQuota,
 };
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MasterMetadataSnapshot {
+    pub objects: Vec<CacheObjectMeta>,
+    pub quotas: Vec<(TenantId, TenantQuota)>,
+    pub evictions_total: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct MasterState {
     objects: HashMap<(TenantId, CacheKey), CacheObjectMeta>,
@@ -23,6 +30,38 @@ pub struct MasterState {
 impl MasterState {
     pub fn new_for_test() -> Self {
         Self::default()
+    }
+
+    #[must_use]
+    pub fn metadata_snapshot(&self) -> MasterMetadataSnapshot {
+        MasterMetadataSnapshot {
+            objects: self.objects.values().cloned().collect(),
+            quotas: self
+                .quotas
+                .iter()
+                .map(|(tenant_id, quota)| (tenant_id.clone(), quota.clone()))
+                .collect(),
+            evictions_total: self.evictions_total,
+        }
+    }
+
+    #[must_use]
+    pub fn from_metadata_snapshot(snapshot: MasterMetadataSnapshot) -> Self {
+        let objects = snapshot
+            .objects
+            .into_iter()
+            .map(|object| (object_key(&object.tenant_id, &object.cache_key), object))
+            .collect();
+        let quotas = snapshot.quotas.into_iter().collect();
+
+        Self {
+            objects,
+            quotas,
+            leases: LeaseTracker::default(),
+            allocator: SegmentAllocator::default(),
+            next_lease_sequence: 0,
+            evictions_total: snapshot.evictions_total,
+        }
     }
 
     pub fn mount_segment(&mut self, node_id: impl Into<String>, len: u64) {
@@ -515,5 +554,26 @@ mod tests {
         let snapshot = state.observability_snapshot();
         assert_eq!(snapshot.objects_total, 1);
         assert_eq!(snapshot.evictions_total, 1);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_restores_committed_metadata_after_failover() {
+        let mut leader = MasterState::new_for_test();
+        leader.set_tenant_quota("tenant-a", 4096, 0).unwrap();
+        leader.mount_segment("node-a", 8192);
+        leader.put_start(&tenant(), &key(), 4096, 1).unwrap();
+        leader.put_end(&tenant(), &key()).unwrap();
+
+        let snapshot = leader.metadata_snapshot();
+        let mut follower = MasterState::from_metadata_snapshot(snapshot);
+
+        let replicas = follower.get_replica_list(&tenant(), &key()).unwrap();
+        assert_eq!(replicas.replicas.len(), 1);
+        assert_eq!(replicas.replicas[0].node_id, "node-a");
+
+        let err = follower
+            .put_start(&tenant(), &second_key(), 1, 1)
+            .unwrap_err();
+        assert!(err.to_string().contains("quota exceeded"));
     }
 }

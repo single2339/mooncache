@@ -1,6 +1,6 @@
 use mooncache_common::{CacheError, CacheResult};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TenantQuota {
     pub dram_bytes: u64,
     pub ssd_bytes: u64,

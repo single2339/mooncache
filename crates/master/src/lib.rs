@@ -8,4 +8,4 @@ pub mod state;
 pub use lease::{Lease, ReplicaList};
 pub use object::{CacheObjectMeta, ObjectStatus, ReplicaDescriptor};
 pub use quota::TenantQuota;
-pub use state::MasterState;
+pub use state::{MasterMetadataSnapshot, MasterState};

@@ -759,10 +759,13 @@ dependencies = [
 name = "mooncache-master-app"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "base64",
  "mooncache-common",
  "mooncache-master",
  "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

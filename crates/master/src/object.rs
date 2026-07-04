@@ -1,6 +1,6 @@
 use mooncache_common::{CacheKey, TenantId};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ObjectStatus {
     Reserving,
     Writing,
@@ -16,7 +16,7 @@ pub struct ReplicaDescriptor {
     pub len: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CacheObjectMeta {
     pub tenant_id: TenantId,
     pub cache_key: CacheKey,
