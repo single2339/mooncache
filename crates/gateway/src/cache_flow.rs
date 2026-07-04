@@ -126,6 +126,34 @@ impl GatewayState {
         }
     }
 
+    /// Construct a GatewayState with arbitrary master/store clients and loaded tenant policy.
+    #[must_use]
+    pub fn new_with_clients_and_tenant_config<V>(
+        master_client: Arc<dyn MasterClient>,
+        store_client: Arc<dyn StoreClient>,
+        vendor: Arc<V>,
+        tenant_configs: TenantConfigSet,
+    ) -> Self
+    where
+        V: VendorAdapter + 'static,
+    {
+        let tenant_id = tenant_configs
+            .tenants()
+            .next()
+            .map(|tenant| tenant.id.clone())
+            .unwrap_or_else(|| TenantId::parse(TEST_TENANT_ID).expect("test tenant id is valid"));
+        Self {
+            master_client,
+            store_client,
+            vendor,
+            tenant_id,
+            tenant_configs: Some(tenant_configs),
+            singleflight: SingleflightGroup::default(),
+            metrics: GatewayMetrics::default(),
+            cache_available: true,
+        }
+    }
+
     fn authenticate(&self, authorization: Option<&str>) -> Option<TenantId> {
         let token = authorization?.strip_prefix("Bearer ")?;
         if let Some(configs) = &self.tenant_configs {
@@ -196,13 +224,14 @@ impl GatewayState {
 
     async fn store_write_preallocated_chunk(
         &self,
+        node_id: &str,
         tenant_id: &TenantId,
         cache_key: &CacheKey,
         handle: &ChunkHandle,
         bytes: &[u8],
     ) -> Result<(), GatewayError> {
         self.store_client
-            .write_preallocated_chunk(tenant_id, cache_key, handle, bytes)
+            .write_preallocated_chunk(node_id, tenant_id, cache_key, handle, bytes)
             .await
     }
 
@@ -715,7 +744,7 @@ async fn write_reserved_replicas(
     for replica in replicas {
         let handle = ChunkHandle::from_replica(replica)?;
         state
-            .store_write_preallocated_chunk(tenant_id, cache_key, &handle, bytes)
+            .store_write_preallocated_chunk(&replica.node_id, tenant_id, cache_key, &handle, bytes)
             .await?;
     }
     Ok(())

@@ -57,6 +57,7 @@ pub trait StoreClient: Send + Sync {
 
     async fn write_preallocated_chunk(
         &self,
+        node_id: &str,
         tenant_id: &TenantId,
         cache_key: &CacheKey,
         handle: &ChunkHandle,
@@ -166,6 +167,7 @@ impl StoreClient for LocalStoreClient {
 
     async fn write_preallocated_chunk(
         &self,
+        _node_id: &str,
         _tenant_id: &TenantId,
         _cache_key: &CacheKey,
         handle: &ChunkHandle,
@@ -205,7 +207,7 @@ pub struct RemoteMasterClient {
 impl RemoteMasterClient {
     pub fn new(base_url: String) -> Self {
         Self {
-            base_url,
+            base_url: base_url.trim_end_matches('/').to_owned(),
             client: Client::new(),
         }
     }
@@ -370,7 +372,10 @@ impl RemoteStoreClient {
     /// Create a client that resolves `node_id` → store HTTP base URL.
     pub fn new(node_urls: HashMap<String, String>) -> Self {
         Self {
-            node_urls,
+            node_urls: node_urls
+                .into_iter()
+                .map(|(node_id, url)| (node_id, url.trim_end_matches('/').to_owned()))
+                .collect(),
             client: Client::new(),
         }
     }
@@ -378,7 +383,10 @@ impl RemoteStoreClient {
     /// Create a client that uses a single URL for all node_ids.
     pub fn new_single_node(node_id: impl Into<String>, base_url: impl Into<String>) -> Self {
         let mut node_urls = HashMap::new();
-        node_urls.insert(node_id.into(), base_url.into());
+        node_urls.insert(
+            node_id.into(),
+            base_url.into().trim_end_matches('/').to_owned(),
+        );
         Self {
             node_urls,
             client: Client::new(),
@@ -435,18 +443,15 @@ impl StoreClient for RemoteStoreClient {
 
     async fn write_preallocated_chunk(
         &self,
+        node_id: &str,
         tenant_id: &TenantId,
         cache_key: &CacheKey,
         handle: &ChunkHandle,
         bytes: &[u8],
     ) -> Result<(), GatewayError> {
-        // For write_preallocated_chunk called from write_reserved_replicas,
-        // the caller iterates over replicas and calls us once per replica.
-        // This Sprint 2/3 client remains single-node; object identity lets Store mirror to SSD.
-        let base_url =
-            self.node_urls.values().next().ok_or_else(|| {
-                GatewayError::StoreUpstream("no store nodes configured".to_string())
-            })?;
+        let base_url = self.node_urls.get(node_id).ok_or_else(|| {
+            GatewayError::StoreUpstream(format!("store node `{node_id}` is not configured"))
+        })?;
         let url = format!("{}/chunks/preallocated", base_url);
         let body = serde_json::json!({
             "tenant_id": tenant_id.as_str(),
@@ -472,5 +477,75 @@ impl StoreClient for RemoteStoreClient {
                 });
             Err(GatewayError::StoreUpstream(err_body.error))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use axum::{routing::post, Json, Router};
+    use mooncache_common::{CacheKey, TenantId};
+    use mooncache_store::ChunkHandle;
+    use serde_json::{json, Value};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn remote_clients_trim_trailing_base_url_slashes() {
+        let master = RemoteMasterClient::new("http://127.0.0.1:8081/".to_owned());
+        assert_eq!(master.base_url, "http://127.0.0.1:8081");
+
+        let store = RemoteStoreClient::new_single_node("node-a", "http://127.0.0.1:8082/");
+        assert_eq!(store.node_urls["node-a"], "http://127.0.0.1:8082");
+    }
+
+    async fn start_store(status: reqwest::StatusCode) -> (String, tokio::task::JoinHandle<()>) {
+        let router = Router::new().route(
+            "/chunks/preallocated",
+            post(move |Json(_body): Json<Value>| async move {
+                (status, Json(json!({"ok": status.is_success()})))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("store test server should bind");
+        let addr = listener.local_addr().expect("store address should exist");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("store test server should run");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn remote_store_routes_preallocated_writes_to_replica_node() {
+        let (wrong_url, wrong_handle) = start_store(reqwest::StatusCode::IM_A_TEAPOT).await;
+        let (right_url, right_handle) = start_store(reqwest::StatusCode::OK).await;
+        let client = RemoteStoreClient::new(HashMap::from([
+            ("node-a".to_owned(), wrong_url),
+            ("node-b".to_owned(), right_url),
+        ]));
+        let tenant_id = TenantId::parse("test-tenant").expect("tenant should parse");
+        let cache_key =
+            CacheKey::from_hex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+                .expect("cache key should parse");
+        let handle = ChunkHandle::new(0, 5);
+
+        StoreClient::write_preallocated_chunk(
+            &client, "node-b", &tenant_id, &cache_key, &handle, b"hello",
+        )
+        .await
+        .expect("write should use node-b URL, not the first configured URL");
+
+        let node_a_error = StoreClient::write_preallocated_chunk(
+            &client, "node-a", &tenant_id, &cache_key, &handle, b"hello",
+        )
+        .await
+        .expect_err("node-a should route to the failing node-a URL");
+        assert!(node_a_error.to_string().contains("unknown error"));
+
+        wrong_handle.abort();
+        right_handle.abort();
     }
 }

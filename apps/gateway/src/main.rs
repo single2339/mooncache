@@ -1,4 +1,9 @@
-use std::{env, process::ExitCode, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    env,
+    process::ExitCode,
+    sync::Arc,
+};
 
 use axum::{
     extract::State,
@@ -10,10 +15,13 @@ use axum::{
 #[cfg(test)]
 use mooncache_gateway::MockVendorAdapter;
 use mooncache_gateway::{
+    clients::{RemoteMasterClient, RemoteStoreClient},
     handle_response_request, GatewayError, GatewayRequest, GatewayResponse, GatewayState,
     OpenAiResponsesAdapter, TenantConfigSet, VendorConfigSet,
 };
+#[cfg(test)]
 use mooncache_master::MasterState;
+#[cfg(test)]
 use mooncache_store::MemoryStore;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -23,6 +31,8 @@ const SERVICE_ENV_PREFIX: &str = "MOONCACHE_GATEWAY";
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_METRICS_BIND_ADDR: &str = "0.0.0.0:9090";
 const DEFAULT_ETCD_URL: &str = "http://127.0.0.1:2379";
+const DEFAULT_MASTER_URL: &str = "http://127.0.0.1:8081";
+const DEFAULT_STORE_NODES: &str = "default=http://127.0.0.1:8082";
 const DEFAULT_TENANT_CONFIG_PATH: &str = "config/tenants.toml";
 const DEFAULT_SSD_ROOT_PATH: &str = "/var/lib/mooncache/ssd";
 const DEFAULT_VENDOR_CONFIG_PATH: &str = "config/vendors.toml";
@@ -31,6 +41,8 @@ const DEFAULT_VENDOR_CONFIG_PATH: &str = "config/vendors.toml";
 struct AppConfig {
     bind_addr: String,
     etcd_url: String,
+    master_url: String,
+    store_node_urls: BTreeMap<String, String>,
     tenant_config_path: String,
     ssd_root_path: String,
     metrics_bind_addr: String,
@@ -65,7 +77,10 @@ async fn main() -> ExitCode {
 }
 
 fn parse_config(args: Vec<String>) -> Result<ParsedConfig, String> {
-    let mut config = AppConfig::from_env();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        return Ok(ParsedConfig::Help);
+    }
+    let mut config = AppConfig::from_env()?;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -79,6 +94,26 @@ fn parse_config(args: Vec<String>) -> Result<ParsedConfig, String> {
             config.etcd_url = next_value(&mut args, "--etcd-url")?;
         } else if let Some(value) = arg.strip_prefix("--etcd-url=") {
             config.etcd_url = required_value(value, "--etcd-url")?;
+        } else if arg == "--master-url" {
+            config.master_url = next_value(&mut args, "--master-url")?;
+        } else if let Some(value) = arg.strip_prefix("--master-url=") {
+            config.master_url = required_value(value, "--master-url")?;
+        } else if arg == "--store-nodes" {
+            config.store_node_urls =
+                parse_store_node_urls(&next_value(&mut args, "--store-nodes")?)?;
+        } else if let Some(value) = arg.strip_prefix("--store-nodes=") {
+            config.store_node_urls =
+                parse_store_node_urls(required_value(value, "--store-nodes")?.as_str())?;
+        } else if arg == "--store-node" {
+            insert_store_node(
+                &mut config.store_node_urls,
+                &next_value(&mut args, "--store-node")?,
+            )?;
+        } else if let Some(value) = arg.strip_prefix("--store-node=") {
+            insert_store_node(
+                &mut config.store_node_urls,
+                required_value(value, "--store-node")?.as_str(),
+            )?;
         } else if arg == "--tenant-config" {
             config.tenant_config_path = next_value(&mut args, "--tenant-config")?;
         } else if let Some(value) = arg.strip_prefix("--tenant-config=") {
@@ -104,15 +139,17 @@ fn parse_config(args: Vec<String>) -> Result<ParsedConfig, String> {
 }
 
 impl AppConfig {
-    fn from_env() -> Self {
-        Self {
+    fn from_env() -> Result<Self, String> {
+        Ok(Self {
             bind_addr: env_value("BIND_ADDR", DEFAULT_BIND_ADDR),
             etcd_url: env_value("ETCD_URL", DEFAULT_ETCD_URL),
+            master_url: env_value("MASTER_URL", DEFAULT_MASTER_URL),
+            store_node_urls: parse_store_node_urls(&env_value("STORE_NODES", DEFAULT_STORE_NODES))?,
             tenant_config_path: env_value("TENANT_CONFIG", DEFAULT_TENANT_CONFIG_PATH),
             ssd_root_path: env_value("SSD_ROOT", DEFAULT_SSD_ROOT_PATH),
             metrics_bind_addr: env_value("METRICS_BIND_ADDR", DEFAULT_METRICS_BIND_ADDR),
             vendor_config_path: env_value("VENDOR_CONFIG", DEFAULT_VENDOR_CONFIG_PATH),
-        }
+        })
     }
 }
 
@@ -120,6 +157,36 @@ fn env_value(suffix: &str, default: &str) -> String {
     env::var(format!("{SERVICE_ENV_PREFIX}_{suffix}"))
         .or_else(|_| env::var(format!("MOONCACHE_{suffix}")))
         .unwrap_or_else(|_| default.to_string())
+}
+
+fn parse_store_node_urls(raw: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut nodes = BTreeMap::new();
+    for item in raw.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        insert_store_node(&mut nodes, item)?;
+    }
+    if nodes.is_empty() {
+        return Err("store node list must not be empty".to_owned());
+    }
+    Ok(nodes)
+}
+
+fn insert_store_node(nodes: &mut BTreeMap<String, String>, item: &str) -> Result<(), String> {
+    let (node_id, url) = item
+        .split_once('=')
+        .ok_or_else(|| format!("store node `{item}` must use NODE_ID=URL"))?;
+    let node_id = node_id.trim();
+    let url = url.trim();
+    if node_id.is_empty() || url.is_empty() {
+        return Err(format!(
+            "store node `{item}` must use non-empty NODE_ID=URL"
+        ));
+    }
+    nodes.insert(node_id.to_owned(), url.trim_end_matches('/').to_owned());
+    Ok(())
 }
 
 fn next_value(args: &mut std::vec::IntoIter<String>, flag: &str) -> Result<String, String> {
@@ -139,7 +206,7 @@ fn required_value(value: &str, flag: &str) -> Result<String, String> {
 
 fn usage() -> String {
     format!(
-        "{SERVICE_NAME}\n\nUsage: cargo run -p mooncache-gateway-app -- [OPTIONS]\n\nOptions:\n  --bind-addr <ADDR>           API bind address [env: {SERVICE_ENV_PREFIX}_BIND_ADDR or MOONCACHE_BIND_ADDR] [default: {DEFAULT_BIND_ADDR}]\n  --etcd-url <URL>             Etcd endpoint URL [env: {SERVICE_ENV_PREFIX}_ETCD_URL or MOONCACHE_ETCD_URL] [default: {DEFAULT_ETCD_URL}]\n  --tenant-config <PATH>       Tenant config path [env: {SERVICE_ENV_PREFIX}_TENANT_CONFIG or MOONCACHE_TENANT_CONFIG] [default: {DEFAULT_TENANT_CONFIG_PATH}]\n  --ssd-root <PATH>            SSD root path [env: {SERVICE_ENV_PREFIX}_SSD_ROOT or MOONCACHE_SSD_ROOT] [default: {DEFAULT_SSD_ROOT_PATH}]\n  --metrics-bind-addr <ADDR>   Metrics bind address [env: {SERVICE_ENV_PREFIX}_METRICS_BIND_ADDR or MOONCACHE_METRICS_BIND_ADDR] [default: {DEFAULT_METRICS_BIND_ADDR}]\n  --vendor-config <PATH>       Vendor config path [env: {SERVICE_ENV_PREFIX}_VENDOR_CONFIG or MOONCACHE_VENDOR_CONFIG] [default: {DEFAULT_VENDOR_CONFIG_PATH}]\n  -h, --help                   Print help and exit\n"
+        "{SERVICE_NAME}\n\nUsage: cargo run -p mooncache-gateway-app -- [OPTIONS]\n\nOptions:\n  --bind-addr <ADDR>           API bind address [env: {SERVICE_ENV_PREFIX}_BIND_ADDR or MOONCACHE_BIND_ADDR] [default: {DEFAULT_BIND_ADDR}]\n  --etcd-url <URL>             Etcd endpoint URL [env: {SERVICE_ENV_PREFIX}_ETCD_URL or MOONCACHE_ETCD_URL] [default: {DEFAULT_ETCD_URL}]\n  --master-url <URL>           Master API URL [env: {SERVICE_ENV_PREFIX}_MASTER_URL or MOONCACHE_MASTER_URL] [default: {DEFAULT_MASTER_URL}]\n  --store-nodes <NODE=URL,..>  Store node URLs [env: {SERVICE_ENV_PREFIX}_STORE_NODES or MOONCACHE_STORE_NODES] [default: {DEFAULT_STORE_NODES}]\n  --store-node <NODE=URL>      Add or replace one store node URL; may repeat\n  --tenant-config <PATH>       Tenant config path [env: {SERVICE_ENV_PREFIX}_TENANT_CONFIG or MOONCACHE_TENANT_CONFIG] [default: {DEFAULT_TENANT_CONFIG_PATH}]\n  --ssd-root <PATH>            SSD root path [env: {SERVICE_ENV_PREFIX}_SSD_ROOT or MOONCACHE_SSD_ROOT] [default: {DEFAULT_SSD_ROOT_PATH}]\n  --metrics-bind-addr <ADDR>   Metrics bind address [env: {SERVICE_ENV_PREFIX}_METRICS_BIND_ADDR or MOONCACHE_METRICS_BIND_ADDR] [default: {DEFAULT_METRICS_BIND_ADDR}]\n  --vendor-config <PATH>       Vendor config path [env: {SERVICE_ENV_PREFIX}_VENDOR_CONFIG or MOONCACHE_VENDOR_CONFIG] [default: {DEFAULT_VENDOR_CONFIG_PATH}]\n  -h, --help                   Print help\n"
     )
 }
 
@@ -147,6 +214,8 @@ fn print_resolved_config(config: &AppConfig) {
     println!("{SERVICE_NAME} resolved config:");
     println!("  bind_addr={}", config.bind_addr);
     println!("  etcd_url={}", config.etcd_url);
+    println!("  master_url={}", config.master_url);
+    println!("  store_node_urls={:?}", config.store_node_urls);
     println!("  tenant_config_path={}", config.tenant_config_path);
     println!("  ssd_root_path={}", config.ssd_root_path);
     println!("  metrics_bind_addr={}", config.metrics_bind_addr);
@@ -237,29 +306,15 @@ fn build_gateway_state_from_config(config: &AppConfig) -> Result<GatewayState, S
         .map_err(|error| format!("failed to build vendor `{}`: {error}", vendor_config.id))?,
     );
 
-    let dram_capacity = tenants
-        .tenants()
-        .map(|tenant| tenant.dram_quota_bytes)
-        .sum::<u64>()
-        .max(1);
-    let mut master = MasterState::new_for_test();
-    master.mount_segment("local-store", dram_capacity);
-    for tenant in tenants.tenants() {
-        master
-            .set_tenant_quota(
-                tenant.id.as_str(),
-                tenant.dram_quota_bytes,
-                tenant.ssd_quota_bytes,
-            )
-            .map_err(|error| {
-                format!("invalid quota for tenant `{}`: {error}", tenant.id.as_str())
-            })?;
-    }
-    let store = MemoryStore::with_capacity(
-        usize::try_from(dram_capacity).map_err(|_| "DRAM capacity does not fit usize")?,
-    );
-    Ok(GatewayState::new_with_tenant_config(
-        master, store, vendor, tenants,
+    let master_client = Arc::new(RemoteMasterClient::new(config.master_url.clone()));
+    let store_client = Arc::new(RemoteStoreClient::new(HashMap::from_iter(
+        config.store_node_urls.clone(),
+    )));
+    Ok(GatewayState::new_with_clients_and_tenant_config(
+        master_client,
+        store_client,
+        vendor,
+        tenants,
     ))
 }
 
@@ -355,6 +410,12 @@ fn json_error(status: StatusCode, message: impl Into<String>) -> Response {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
     use axum::{
         body::{to_bytes, Body},
         http::{header, Request, StatusCode},
@@ -396,6 +457,140 @@ mod tests {
         });
         (format!("http://{addr}/v1"), handle)
     }
+
+    struct RemoteTestCluster {
+        master_url: String,
+        store_url: String,
+        master_start_count: Arc<AtomicUsize>,
+        store_write_count: Arc<AtomicUsize>,
+        master_handle: tokio::task::JoinHandle<()>,
+        store_handle: tokio::task::JoinHandle<()>,
+    }
+
+    async fn serve_remote_master_and_store() -> RemoteTestCluster {
+        let committed_len = Arc::new(Mutex::new(None::<u64>));
+        let pending_len = Arc::new(Mutex::new(None::<u64>));
+        let stored_bytes = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let master_start_count = Arc::new(AtomicUsize::new(0));
+        let store_write_count = Arc::new(AtomicUsize::new(0));
+
+        let master = Router::new()
+            .route(
+                "/objects/replicas",
+                get({
+                    let committed_len = Arc::clone(&committed_len);
+                    move || {
+                        let committed_len = Arc::clone(&committed_len);
+                        async move {
+                            match *committed_len.lock().expect("committed length lock should work") {
+                                Some(len) => (
+                                    StatusCode::OK,
+                                    Json(json!({"replicas": [{"node_id": "default", "offset": 0, "len": len}]})),
+                                ),
+                                None => (
+                                    StatusCode::NOT_FOUND,
+                                    Json(json!({"error": "cache object not found"})),
+                                ),
+                            }
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/objects/start",
+                post({
+                    let master_start_count = Arc::clone(&master_start_count);
+                    let pending_len = Arc::clone(&pending_len);
+                    move |Json(body): Json<Value>| {
+                        let master_start_count = Arc::clone(&master_start_count);
+                        let pending_len = Arc::clone(&pending_len);
+                        async move {
+                            master_start_count.fetch_add(1, Ordering::SeqCst);
+                            let len = body["len"].as_u64().expect("start request should include len");
+                            *pending_len.lock().expect("pending length lock should work") = Some(len);
+                            (
+                                StatusCode::OK,
+                                Json(json!({"replicas": [{"node_id": "default", "offset": 0, "len": len}]})),
+                            )
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/objects/end",
+                post({
+                    let committed_len = Arc::clone(&committed_len);
+                    let pending_len = Arc::clone(&pending_len);
+                    move |_body: Json<Value>| {
+                        let committed_len = Arc::clone(&committed_len);
+                        let pending_len = Arc::clone(&pending_len);
+                        async move {
+                            *committed_len.lock().expect("committed length lock should work") =
+                                *pending_len.lock().expect("pending length lock should work");
+                            (StatusCode::OK, Json(json!({"ok": true})))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/objects/revoke",
+                post(|| async { (StatusCode::OK, Json(json!({"ok": true}))) }),
+            );
+        let master_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let master_addr = master_listener.local_addr().unwrap();
+        let master_handle = tokio::spawn(async move {
+            axum::serve(master_listener, master).await.unwrap();
+        });
+
+        let store = Router::new()
+            .route(
+                "/chunks/preallocated",
+                post({
+                    let stored_bytes = Arc::clone(&stored_bytes);
+                    let store_write_count = Arc::clone(&store_write_count);
+                    move |Json(body): Json<Value>| {
+                        let stored_bytes = Arc::clone(&stored_bytes);
+                        let store_write_count = Arc::clone(&store_write_count);
+                        async move {
+                            store_write_count.fetch_add(1, Ordering::SeqCst);
+                            let data: Vec<u8> = serde_json::from_value(body["data"].clone()).unwrap();
+                            *stored_bytes.lock().expect("stored bytes lock should work") = data;
+                            (StatusCode::OK, Json(json!({"ok": true})))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/chunks/{offset}/{len}",
+                get({
+                    let stored_bytes = Arc::clone(&stored_bytes);
+                    move || {
+                        let stored_bytes = Arc::clone(&stored_bytes);
+                        async move {
+                            let bytes = stored_bytes.lock().expect("stored bytes lock should work").clone();
+                            (
+                                StatusCode::OK,
+                                Json(json!({"offset": 0, "len": bytes.len(), "tier": "dram", "data": bytes})),
+                            )
+                        }
+                    }
+                }),
+            );
+        let store_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let store_addr = store_listener.local_addr().unwrap();
+        let store_handle = tokio::spawn(async move {
+            axum::serve(store_listener, store).await.unwrap();
+        });
+
+        RemoteTestCluster {
+            master_url: format!("http://{master_addr}"),
+            store_url: format!("http://{store_addr}"),
+            master_start_count,
+            store_write_count,
+            master_handle,
+            store_handle,
+        }
+    }
     use tower::ServiceExt;
 
     #[test]
@@ -404,6 +599,11 @@ mod tests {
             "--bind-addr".to_string(),
             "127.0.0.1:18080".to_string(),
             "--etcd-url=http://etcd:2379".to_string(),
+            "--master-url".to_string(),
+            "http://master:8081".to_string(),
+            "--store-nodes=node-a=http://store-a:8082".to_string(),
+            "--store-node".to_string(),
+            "node-b=http://store-b:8082".to_string(),
             "--tenant-config".to_string(),
             "local/tenants.toml".to_string(),
             "--ssd-root".to_string(),
@@ -420,6 +620,14 @@ mod tests {
 
         assert_eq!(config.bind_addr, "127.0.0.1:18080");
         assert_eq!(config.etcd_url, "http://etcd:2379");
+        assert_eq!(config.master_url, "http://master:8081");
+        assert_eq!(
+            config.store_node_urls,
+            BTreeMap::from([
+                ("node-a".to_owned(), "http://store-a:8082".to_owned()),
+                ("node-b".to_owned(), "http://store-b:8082".to_owned()),
+            ])
+        );
         assert_eq!(config.tenant_config_path, "local/tenants.toml");
         assert_eq!(config.ssd_root_path, "local/ssd");
         assert_eq!(config.metrics_bind_addr, "127.0.0.1:19090");
@@ -439,6 +647,17 @@ mod tests {
             parse_config(vec!["--bind-addr".to_string()]).expect_err("missing value should fail");
 
         assert_eq!(error, "--bind-addr requires a value");
+    }
+
+    #[test]
+    fn invalid_store_nodes_is_an_error() {
+        let error = parse_config(vec![
+            "--store-nodes".to_string(),
+            "missing-equals".to_string(),
+        ])
+        .expect_err("malformed store nodes should fail");
+
+        assert_eq!(error, "store node `missing-equals` must use NODE_ID=URL");
     }
 
     #[tokio::test]
@@ -565,9 +784,12 @@ mod tests {
             ),
         )
         .unwrap();
+        let cluster = serve_remote_master_and_store().await;
         let config = AppConfig {
             bind_addr: "127.0.0.1:0".to_owned(),
             etcd_url: DEFAULT_ETCD_URL.to_owned(),
+            master_url: cluster.master_url.clone(),
+            store_node_urls: BTreeMap::from([("default".to_owned(), cluster.store_url.clone())]),
             tenant_config_path: tenant_config.display().to_string(),
             ssd_root_path: tempdir.path().join("ssd").display().to_string(),
             metrics_bind_addr: "127.0.0.1:0".to_owned(),
@@ -597,6 +819,18 @@ mod tests {
         assert_eq!(body["output_text"], json!("from configured vendor"));
         let vendor_request = captured_request.await.unwrap();
         assert!(vendor_request.contains("authorization: Bearer configured-vendor-token"));
+        assert_eq!(
+            cluster.master_start_count.load(Ordering::SeqCst),
+            1,
+            "configured gateway must reserve through remote master, not a local MasterState"
+        );
+        assert_eq!(
+            cluster.store_write_count.load(Ordering::SeqCst),
+            1,
+            "configured gateway must write through remote store, not a local MemoryStore"
+        );
+        cluster.master_handle.abort();
+        cluster.store_handle.abort();
     }
     async fn response_json(response: axum::response::Response) -> Value {
         let bytes = to_bytes(response.into_body(), usize::MAX)
