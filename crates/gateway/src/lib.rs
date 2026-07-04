@@ -1,4 +1,5 @@
 pub mod cache_flow;
+pub mod config;
 pub mod routes;
 pub mod singleflight;
 pub mod streaming;
