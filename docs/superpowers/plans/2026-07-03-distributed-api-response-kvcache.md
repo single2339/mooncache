@@ -8,6 +8,10 @@
 
 **Tech Stack:** Rust stable, Tokio, Axum, Serde, Reqwest, SHA-256, etcd-client, metrics/tracing, React 19-compatible TypeScript + Vite, TanStack Query, Vitest, Playwright later for E2E.
 
+## Current Implementation Status
+
+This plan has been implemented as a local, test-verified Rust/React skeleton with real Gateway → Master HTTP and Gateway → Store HTTP wiring, OpenAI Responses adapter support, tenant/vendor config files, local Docker Compose topology, and the React operations console. Production-grade Master HA, etcd-backed metadata persistence, multi-replica scheduling, credential rotation, and SSD cold-tier operations remain roadmap work; the unchecked task boxes below are preserved as the original implementation checklist rather than a production-completeness claim.
+
 ## Global Constraints
 
 - The cache primitive is an API response object cache, not raw transformer KV tensors.
