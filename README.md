@@ -260,10 +260,27 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-### 运行 Gateway 本地服务
+### 准备本地配置
 
 ```bash
-cargo run -p mooncache-gateway-app -- --bind-addr=127.0.0.1:8080
+cp config/tenants.example.toml config/tenants.toml
+cp config/vendors.example.toml config/vendors.toml
+export OPENAI_API_KEY=sk-...
+```
+
+示例租户的 plaintext bearer token 是 `demo-api-key-do-not-use`。
+
+### 运行 Gateway 本地服务
+
+Gateway 生产路径通过 HTTP 访问 Master 和 Store Node。先在其他终端启动 Master 和 Store Node，再启动 Gateway：
+
+```bash
+cargo run -p mooncache-gateway-app -- \
+  --bind-addr=127.0.0.1:8080 \
+  --master-url=http://127.0.0.1:8081 \
+  --store-nodes=default=http://127.0.0.1:8082 \
+  --tenant-config=config/tenants.toml \
+  --vendor-config=config/vendors.toml
 ```
 
 健康检查：
@@ -276,19 +293,19 @@ curl http://127.0.0.1:8080/healthz
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/responses \
-  -H 'authorization: Bearer test-api-key' \
+  -H 'authorization: Bearer demo-api-key-do-not-use' \
   -H 'content-type: application/json' \
-  -d '{"model":"gpt-test","input":"hello"}'
+  -d '{"model":"gpt-4.1-mini","input":"hello","temperature":0}'
 ```
 
-开发态 Gateway 会返回 mock vendor 响应，并对可缓存请求走本地 MemoryStore 缓存路径。
+Gateway 会先查远程 Master/Store 缓存；miss 后调用 `config/vendors.toml` 中配置的供应商 API，并在完整成功响应后写回 Store Node。
 
 ### 运行其他本地服务
 
 ```bash
-cargo run -p mooncache-master-app -- --bind-addr=127.0.0.1:8081
-cargo run -p mooncache-store-node-app -- --bind-addr=127.0.0.1:8082
-cargo run -p mooncache-admin-api-app -- --bind-addr=127.0.0.1:8083
+cargo run -p mooncache-master-app -- --bind-addr=127.0.0.1:8081 --tenant-config=config/tenants.toml
+cargo run -p mooncache-store-node-app -- --bind-addr=127.0.0.1:8082 --tenant-config=config/tenants.toml
+cargo run -p mooncache-admin-api-app -- --bind-addr=127.0.0.1:8083 --tenant-config=config/tenants.toml --vendor-config=config/vendors.toml
 ```
 
 各服务都支持 `--help` 查看参数：
@@ -354,6 +371,8 @@ Control Panel 页面包括：
 - admin-api
 - control-panel
 
+Compose 中 Gateway 显式使用 `http://master:8081` 和 `default=http://store-node:8082`，与 Master 默认分配的 Store 节点 ID `default` 对齐。
+
 构建前端静态资源：
 
 ```bash
@@ -403,12 +422,12 @@ docker compose up
 
 开发态限制：
 
-- Gateway app 当前使用 `GatewayState::new_for_test`、`MemoryStore` 和 `MockVendorAdapter`。
-- 本地鉴权使用 `Bearer test-api-key`。
-- Master app / Store app / Admin app 是本地可运行 HTTP 骨架，不是完整生产集群控制面。
+- Gateway app 生产路径使用 `config/tenants.toml`、`config/vendors.toml`、远程 Master HTTP API 和 Store Node HTTP API；单元/集成测试仍保留 `MockVendorAdapter`。
+- 示例租户本地鉴权使用 `Bearer demo-api-key-do-not-use`，生产部署必须替换为真实密钥管理和轮换机制。
+- Master app / Store app / Admin app 是本地可运行 HTTP 骨架，Master 状态持久化、leader / standby 和生产级调度仍需完善。
 - SSD 二级缓存已有边界和设计方向，但生产级冷热迁移仍需后续完善。
 - etcd HA 状态持久化仍需生产化接入。
-- 真实 vendor adapter、tenant config 和 API key 管理仍需后续实现。
+- OpenAI Responses adapter 已接入，更多供应商 adapter、凭证管理和成本治理仍需扩展。
 
 ## 验证命令
 
@@ -425,9 +444,9 @@ cd control-panel && npm test && npm run build
 
 - `cargo fmt --check`：通过
 - `cargo clippy --workspace --all-targets -- -D warnings`：通过
-- `cargo test --workspace`：`100 passed`, `23 suites`, `1 ignored`
-- `cargo test -p mooncache-gateway-app`：`4 passed`
-- `control-panel npm test`：`4 files`, `16 tests` 通过
+- `cargo test --workspace`：`151 passed`, `24 suites`, `1 ignored`
+- `cargo test -p mooncache-gateway-app`：`6 passed`, `1 suite`
+- `control-panel npm test`：`4 files`, `19 tests` 通过
 - `control-panel npm run build`：通过
 
 ## 设计文档
@@ -456,11 +475,11 @@ docs/superpowers/plans/2026-07-03-distributed-api-response-kvcache.md
 
 推荐下一阶段优先级：
 
-1. 接入真实 vendor adapter 和 vendor config。
-2. 接入真实 tenant config、API key 管理和认证中间件。
+1. 扩展更多 vendor adapter，并接入生产级凭证管理。
+2. 强化真实 tenant API key 管理、认证中间件和密钥轮换。
 3. 将 Master 状态持久化到 etcd，并支持 leader / standby。
 4. 完成 SSD cold tier、DRAM promotion 和容量水位 eviction。
-5. 将 Gateway / Master / Store 之间的本地调用替换为清晰的 RPC 边界。
+5. 强化 Gateway / Master / Store 之间的 HTTP/RPC 边界、重试和多节点路由。
 6. 补齐 Prometheus metrics、structured tracing 和 dashboard。
 7. 在真实 Docker / Kubernetes 环境做端到端部署验证。
 8. 增加 Playwright E2E 覆盖 Control Panel 关键操作流。
