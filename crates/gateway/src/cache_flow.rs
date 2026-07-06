@@ -1,4 +1,8 @@
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use mooncache_common::{
     CacheError, CacheKey, CacheStatus as ObservedCacheStatus,
@@ -11,6 +15,7 @@ use mooncache_fingerprint::{
 use mooncache_master::{MasterState, ReplicaDescriptor, ReplicaList};
 use mooncache_protocol::{CacheControl, CacheStatus, ResponsesRequest};
 use mooncache_store::{ChunkHandle, MemoryStore, StoreError};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -27,6 +32,7 @@ const ENDPOINT_VERSION: &str = "responses-v1";
 const TEST_API_KEY: &str = "test-api-key";
 const TEST_TENANT_ID: &str = "test-tenant";
 const REPLICA_COUNT: usize = 1;
+const CACHED_RESPONSE_OBJECT_TYPE: &str = "mooncache.cached-response.v1";
 
 pub struct GatewayState {
     master_client: Arc<dyn MasterClient>,
@@ -171,6 +177,15 @@ impl GatewayState {
         configs
             .tenant(tenant_id.as_str())
             .is_some_and(|tenant| tenant.allowed_vendors.iter().any(|id| id == vendor_id))
+    }
+
+    fn cache_expires_at_ms(&self, tenant_id: &TenantId) -> Option<u64> {
+        let ttl_seconds = self
+            .tenant_configs
+            .as_ref()?
+            .tenant(tenant_id.as_str())?
+            .default_ttl_seconds;
+        Some(now_ms().saturating_add(duration_millis(ttl_seconds)))
     }
 
     async fn master_get_replica_list(
@@ -646,8 +661,13 @@ async fn read_cached_body(
     let Some(chunk) = read_cached_bytes(state, tenant_id, cache_key).await? else {
         return Ok(None);
     };
+    let cached_body = decode_cached_body(&chunk.bytes)?;
+    if cached_body.is_expired() {
+        state.master_put_revoke(tenant_id, cache_key).await?;
+        return Ok(None);
+    }
     Ok(Some(CachedPayload {
-        value: streaming::cached_body_from_bytes(&chunk.bytes)?,
+        value: cached_body.value,
         tier: chunk.tier,
     }))
 }
@@ -663,6 +683,10 @@ async fn read_cached_stream_object(
     let Some(value) = streaming::stream_object_from_bytes(&chunk.bytes)? else {
         return Ok(None);
     };
+    if is_expired(value.expires_at_ms) {
+        state.master_put_revoke(tenant_id, cache_key).await?;
+        return Ok(None);
+    }
     Ok(Some(CachedPayload {
         value,
         tier: chunk.tier,
@@ -696,7 +720,7 @@ async fn write_cached_body(
     cache_key: &CacheKey,
     body: &Value,
 ) -> Result<CacheWriteStatus, GatewayError> {
-    let bytes = serde_json::to_vec(body)?;
+    let bytes = serialize_cached_body(body, state.cache_expires_at_ms(tenant_id))?;
     write_cached_bytes(state, tenant_id, cache_key, &bytes).await
 }
 
@@ -706,7 +730,10 @@ async fn write_cached_stream_object(
     cache_key: &CacheKey,
     captured: &CapturedStream,
 ) -> Result<CacheWriteStatus, GatewayError> {
-    let bytes = streaming::serialize_stream_object(captured)?;
+    let bytes = streaming::serialize_stream_object_with_expiry(
+        captured,
+        state.cache_expires_at_ms(tenant_id),
+    )?;
     write_cached_bytes(state, tenant_id, cache_key, &bytes).await
 }
 
@@ -763,6 +790,75 @@ async fn revoke_reservation_after_write_failure(
             revoke_error: revoke_error.to_string(),
         },
     }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CachedResponseObject {
+    mooncache_object: String,
+    expires_at_ms: Option<u64>,
+    body: Value,
+}
+
+struct DecodedCachedBody {
+    value: Value,
+    expires_at_ms: Option<u64>,
+}
+
+impl DecodedCachedBody {
+    fn is_expired(&self) -> bool {
+        is_expired(self.expires_at_ms)
+    }
+}
+
+fn serialize_cached_body(
+    body: &Value,
+    expires_at_ms: Option<u64>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&CachedResponseObject {
+        mooncache_object: CACHED_RESPONSE_OBJECT_TYPE.to_owned(),
+        expires_at_ms,
+        body: body.clone(),
+    })
+}
+
+fn decode_cached_body(bytes: &[u8]) -> Result<DecodedCachedBody, GatewayError> {
+    let value: Value = serde_json::from_slice(bytes)?;
+    if value
+        .get("mooncache_object")
+        .and_then(Value::as_str)
+        .is_some_and(|object_type| object_type == CACHED_RESPONSE_OBJECT_TYPE)
+    {
+        let object: CachedResponseObject = serde_json::from_value(value)?;
+        return Ok(DecodedCachedBody {
+            value: object.body,
+            expires_at_ms: object.expires_at_ms,
+        });
+    }
+
+    Ok(DecodedCachedBody {
+        value: streaming::cached_body_from_bytes(bytes)?,
+        expires_at_ms: None,
+    })
+}
+
+fn is_expired(expires_at_ms: Option<u64>) -> bool {
+    expires_at_ms.is_some_and(|expires_at_ms| now_ms() >= expires_at_ms)
+}
+
+fn duration_millis(seconds: u64) -> u64 {
+    Duration::from_secs(seconds)
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 impl CacheWriteStatus {

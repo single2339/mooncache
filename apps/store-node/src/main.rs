@@ -51,6 +51,8 @@ struct StoreNodeState {
 
 #[derive(Debug, Deserialize)]
 struct WriteChunkRequest {
+    tenant_id: Option<String>,
+    cache_key: Option<String>,
     len: usize,
     data: Vec<u8>,
 }
@@ -217,10 +219,25 @@ impl StoreNodeState {
         }
     }
 
-    fn allocate_and_write(&self, len: usize, data: &[u8]) -> Result<ChunkHandle, StoreError> {
-        let mut dram = self.dram.lock();
-        let handle = dram.allocate(len)?;
-        dram.write_chunk(&handle, data)?;
+    async fn allocate_and_write(
+        &self,
+        len: usize,
+        data: &[u8],
+        tenant_id: Option<&str>,
+        cache_key: Option<&str>,
+    ) -> Result<ChunkHandle, StoreNodeError> {
+        let handle = {
+            let mut dram = self.dram.lock();
+            let handle = dram.allocate(len)?;
+            dram.write_chunk(&handle, data)?;
+            handle
+        };
+
+        if let (Some(ssd), Some(tenant_id), Some(cache_key)) = (&self.ssd, tenant_id, cache_key) {
+            ssd.persist_object(tenant_id, cache_key, data).await?;
+            self.record_ssd_object(tenant_id, cache_key, data.len());
+        }
+
         Ok(handle)
     }
 
@@ -432,8 +449,14 @@ async fn post_chunk(
     Json(req): Json<WriteChunkRequest>,
 ) -> Result<Json<WriteChunkResponse>, (StatusCode, Json<Value>)> {
     let handle = state
-        .allocate_and_write(req.len, &req.data)
-        .map_err(store_error_to_response)?;
+        .allocate_and_write(
+            req.len,
+            &req.data,
+            req.tenant_id.as_deref(),
+            req.cache_key.as_deref(),
+        )
+        .await
+        .map_err(store_node_error_to_response)?;
     Ok(Json(WriteChunkResponse {
         ok: true,
         offset: handle.offset(),
