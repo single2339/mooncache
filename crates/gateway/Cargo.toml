@@ -35,6 +35,10 @@ name = "streaming_flow"
 path = "../../tests/integration/streaming_flow.rs"
 
 [[test]]
+name = "streaming_replay"
+path = "../../tests/integration/streaming_replay.rs"
+
+[[test]]
 name = "e2e_cluster"
 path = "../../tests/integration/e2e_cluster.rs"
 
@@ -45,3 +49,7 @@ path = "../../tests/integration/load_smoke.rs"
 [[test]]
 name = "distributed_cache_flow"
 path = "../../tests/integration/distributed_cache_flow.rs"
+
+[[test]]
+name = "ttl_lifecycle"
+path = "../../tests/integration/ttl_lifecycle.rs"

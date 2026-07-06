@@ -16,3 +16,8 @@ tokio.workspace = true
 [dev-dependencies]
 tower.workspace = true
 tempfile.workspace = true
+reqwest.workspace = true
+
+[[test]]
+name = "ssd_cold_tier"
+path = "../../tests/integration/ssd_cold_tier.rs"

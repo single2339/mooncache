@@ -16,6 +16,8 @@ pub(crate) struct CapturedStream {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct CachedStreamObject {
     mooncache_object: String,
+    #[serde(default)]
+    pub(crate) expires_at_ms: Option<u64>,
     pub(crate) events: Vec<SseEvent>,
     pub(crate) final_body: Value,
 }
@@ -32,11 +34,13 @@ pub(crate) async fn collect_stream(
     Ok(CapturedStream { events, final_body })
 }
 
-pub(crate) fn serialize_stream_object(
+pub(crate) fn serialize_stream_object_with_expiry(
     captured: &CapturedStream,
+    expires_at_ms: Option<u64>,
 ) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(&CachedStreamObject {
         mooncache_object: STREAMING_OBJECT_TYPE.to_owned(),
+        expires_at_ms,
         events: captured.events.clone(),
         final_body: captured.final_body.clone(),
     })
@@ -111,7 +115,7 @@ mod tests {
             final_body: json!({"id":"resp_1"}),
         };
 
-        let bytes = serialize_stream_object(&captured).unwrap();
+        let bytes = serialize_stream_object_with_expiry(&captured, None).unwrap();
         let object = stream_object_from_bytes(&bytes).unwrap().unwrap();
 
         assert_eq!(object.events, captured.events);
@@ -128,7 +132,7 @@ mod tests {
             final_body: json!({"id":"resp_1"}),
         };
 
-        let bytes = serialize_stream_object(&captured).unwrap();
+        let bytes = serialize_stream_object_with_expiry(&captured, None).unwrap();
 
         assert_eq!(
             cached_body_from_bytes(&bytes).unwrap(),

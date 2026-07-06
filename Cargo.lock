@@ -804,6 +804,7 @@ dependencies = [
  "mooncache-common",
  "mooncache-store",
  "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

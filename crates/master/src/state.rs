@@ -106,8 +106,15 @@ impl MasterState {
         replica_count: usize,
     ) -> CacheResult<Vec<ReplicaDescriptor>> {
         let object_key = object_key(tenant_id, cache_key);
-        if self.objects.contains_key(&object_key) {
-            return Err(CacheError::Conflict("object already exists".into()));
+        if let Some(existing) = self.objects.get(&object_key) {
+            if matches!(
+                existing.status,
+                ObjectStatus::Revoked | ObjectStatus::Evicted
+            ) {
+                self.objects.remove(&object_key);
+            } else {
+                return Err(CacheError::Conflict("object already exists".into()));
+            }
         }
 
         self.reserve_tenant_quota(tenant_id, len)?;
